@@ -87,8 +87,11 @@ curl "https://audi0-scraper.onrender.com/v1/trending/gym?limit=10"
 ```
 
 Ranking is `trend_score` descending. Use `confidence >= 0.5` to drop
-single-source noise. First call of the day builds the ranking (a few seconds);
-after that it is served from cache until `refresh=1` or the next day.
+single-source noise. The **first call per niche per day is slow** — it builds the
+ranking live (up to ~2 min on the free tier; a 90s budget caps the work, then
+best-effort results are cached). Subsequent calls that day return in <0.5s. Pass
+`refresh=1` to force a rebuild. Tip: warm niches with a scheduled call (or just
+call it at the start of your run, not in the hot path).
 
 ### `GET /v1/niches`
 
