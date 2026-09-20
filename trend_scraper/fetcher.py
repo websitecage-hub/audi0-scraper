@@ -16,12 +16,12 @@ class HTTPFetcher:
     (the engine falls back to the stealth browser or Wayback).
     """
 
-    def __init__(self, impersonate: str = "chrome", timeout: int = 45, delay: float = 0.6):
+    def __init__(self, impersonate: str = "chrome", timeout: int = 20, delay: float = 0.4):
         self.impersonate = impersonate
         self.timeout = timeout
         self.delay = delay
 
-    def fetch(self, url: str, retries: int = 2) -> tuple[int | None, bytes]:
+    def fetch(self, url: str, retries: int = 1) -> tuple[int | None, bytes]:
         last_status, last_body = None, b""
         for attempt in range(retries + 1):
             try:

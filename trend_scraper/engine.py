@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from urllib.parse import quote
 
@@ -46,6 +48,7 @@ class TrendingAudioEngine:
         use_search: bool = True,
         use_stealth: bool = True,
         use_charts: bool = True,
+        deadline_s: float | None = 120.0,
     ):
         self.cache_dir = cache_dir
         self.max_search_pages = max_search_pages
@@ -55,6 +58,10 @@ class TrendingAudioEngine:
         self.use_search = use_search          # DDG discovery (needs a browser)
         self.use_stealth = use_stealth        # allow the headless browser at all
         self.use_charts = use_charts          # real iTunes/Deezer chart data
+        # Wall-clock budget: once exceeded, remaining source passes are skipped
+        # so a slow free-tier instance can never hang a request indefinitely.
+        self.deadline_s = deadline_s
+        self._deadline: float | None = None
         self.http = HTTPFetcher()
         # StealthFetcher launches a real browser lazily; on a free-tier API with
         # no chromium we set use_stealth=False and never touch it.
@@ -66,6 +73,11 @@ class TrendingAudioEngine:
         if self._stealth is None:
             self._stealth = StealthFetcher()
         return self._stealth
+
+    # -- wall-clock budget --------------------------------------------------
+    def _expired(self) -> bool:
+        """True once the collect() budget is spent (skip remaining passes)."""
+        return self._deadline is not None and time.monotonic() >= self._deadline
 
     # -- caching ----------------------------------------------------------
     def _cache_path(self, niche: str) -> str:
@@ -113,7 +125,10 @@ class TrendingAudioEngine:
         status, body = self.http.fetch(url)
         if status and (200 <= status < 300) and body:
             return body
-        # blocked -> try an archived copy
+        # blocked -> try an archived copy (skipped once the budget is spent, and
+        # only for sources that are worth the extra round-trip)
+        if self._expired():
+            return None
         snap = self._wayback_snapshot(url) if "archive.org" not in url else None
         if snap:
             status, body = self.http.fetch(snap)
@@ -159,13 +174,18 @@ class TrendingAudioEngine:
 
         all_tracks: dict[tuple[str, str], Track] = {}
         seen_urls: set[str] = set()
+        self._deadline = (time.monotonic() + self.deadline_s) if self.deadline_s else None
 
         # 0) REAL chart data (iTunes + Deezer) — the strongest, browser-free
-        #    evidence: explicit ranks, genre tags, live updates. This also seeds
-        #    the candidate pool for every niche question.
-        if self.use_charts:
+        #    evidence: explicit ranks, genre tags, live updates. Fetched in
+        #    parallel because these are the slowest and most valuable sources.
+        if self.use_charts and not self._expired():
             try:
-                for ce in fetch_all_charts(niche.name, http=self.http):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    entries = pool.submit(fetch_all_charts, niche.name).result(
+                        timeout=max(5.0, (self._deadline or 0) - time.monotonic())
+                        if self._deadline else 60)
+                for ce in entries:
                     tr = Track(title=ce.title, artist=ce.artist,
                                source=ce.chart, category="song")
                     tr.best_rank = ce.rank
@@ -173,20 +193,23 @@ class TrendingAudioEngine:
                     tr.sample_url = ce.url
                     if ce.release_date:
                         tr.first_seen = ce.release_date
-                    # fold real genre tags into the niche-relevance lexicon
                     tr.origin_label = "chart"
                     self._merge(all_tracks, tr, source=ce.chart,
                                 is_current=True, origin="chart")
-                    # genre -> relevance boost, recorded on the track
                     if ce.genres:
                         all_tracks[(ce.title.lower(), ce.artist.lower())].category = \
                             "song:" + ",".join(ce.genres[:3])
             except Exception as exc:
                 log.warning("chart pass failed: %s", exc)
 
-        # 1) niche-targeted search pass -> niche blog/list pages (relevance evidence)
-        for q in (niche.queries[:4] if self.use_search else []):
-            for i in range(1, 3):  # a couple of query phrasings
+        # 1) niche-targeted search pass -> niche blog/list pages (relevance
+        #    evidence). Deliberately narrow (2 queries x 4 pages): this is the
+        #    most expensive pass and the charts already carry the ranking.
+        for q in (niche.queries[:2] if self.use_search else []):
+            if self._expired():
+                log.info("deadline reached; skipping remaining search queries")
+                break
+            for i in range(1, 2):  # a couple of query phrasings
                 query = f"best {q} songs for instagram reels trending" if i == 1 else \
                         f"{q} reels audio viral trending list"
                 hits = (ddg_lite_search(query, max_results=self.max_results,
@@ -209,8 +232,11 @@ class TrendingAudioEngine:
                     break
 
         # 2) current-trending aggregators (momentum evidence)
-        if self.use_current:
+        if self.use_current and not self._expired():
             for src in CURRENT_TRENDING:
+                if self._expired():
+                    log.info("deadline reached; stopping current-trend feeds")
+                    break
                 body = self._fetch_any(src.url, use_stealth=src.use_stealth)
                 if body:
                     hits = extract_tracks(body, source=src.name)

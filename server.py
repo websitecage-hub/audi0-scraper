@@ -93,6 +93,7 @@ def trending(niche: str):
             cache_dir=os.path.join(app.config["LIBRARY"], "_trending"),
             use_search=True,         # browser-free Bing/DDG-HTML search
             use_stealth=False,       # no chromium on the free-tier image
+            deadline_s=float(os.getenv("TL_TRENDING_BUDGET_S", "90")),
         )
         tracks = engine.collect(Niche.from_name(niche), use_cache=use_cache)
         return jsonify({
