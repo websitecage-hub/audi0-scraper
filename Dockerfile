@@ -32,6 +32,4 @@ COPY . .
 EXPOSE 8000
 # gunicorn: 1 worker (capped RAM for free tier), threads for concurrency,
 # long timeout (600s) so yt-dlp/ffmpeg downloads aren't killed mid-request.
-CMD ["gunicorn", "-w", "1", "--threads", "4", "--timeout", "600",
-     "--graceful-timeout", "30", "--worker-class", "gthread",
-     "-b", "0.0.0.0:8000", "server:app"]
+CMD ["gunicorn", "-w", "1", "--threads", "4", "--timeout", "600", "--graceful-timeout", "30", "--worker-class", "gthread", "-b", "0.0.0.0:8000", "server:app"]
