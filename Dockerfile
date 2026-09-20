@@ -7,10 +7,13 @@ ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     TL_LIBRARY=/data
 
-# ffmpeg (audio extraction) + chromium runtime libs (Scrapling stealth browser)
+# ffmpeg (audio extraction) + chromium runtime libs (Scrapling stealth browser) + git
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        git \
         curl \
+        ca-certificates \
+        build-essential \
         fonts-liberation \
         libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
