@@ -60,6 +60,8 @@ def index():
         "docs": "USAGE.md in the repo",
         "endpoints": {
             "health": "GET /health",
+            "trending": "GET /v1/trending/<niche>?limit=20&refresh=0",
+            "niches": "GET /v1/niches",
             "download": "POST /v1/download  {url, niche?, title?, artist?, cookies?}",
             "library": "GET /v1/library/<niche>",
             "file": "GET /v1/file/<niche>/<filename>",
@@ -70,6 +72,44 @@ def index():
 @app.get("/favicon.ico")
 def favicon():
     return ("", 204)
+
+
+@app.get("/v1/trending/<niche>")
+def trending(niche: str):
+    """Return ranked trending audio for a niche (discovery, cached per day).
+
+    Runs the browser-free discovery path so it is safe on the free-tier API:
+    aggregator/evergreen feeds + Wayback, no headless browser. Results are
+    ranked by the composite trend score (cross-source corroboration + momentum).
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 100))
+    except ValueError:
+        limit = 20
+    use_cache = request.args.get("refresh", "0") != "1"
+    try:
+        from trend_scraper import Niche, TrendingAudioEngine
+        engine = TrendingAudioEngine(
+            cache_dir=os.path.join(app.config["LIBRARY"], "_trending"),
+            use_search=True,         # browser-free Bing/DDG-HTML search
+            use_stealth=False,       # no chromium on the free-tier image
+        )
+        tracks = engine.collect(Niche.from_name(niche), use_cache=use_cache)
+        return jsonify({
+            "niche": Niche.from_name(niche).name,
+            "count": min(limit, len(tracks)),
+            "cached": use_cache,
+            "results": [t.__dict__ for t in tracks[:limit]],
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)[:300]}), 500
+
+
+@app.get("/v1/niches")
+def niches():
+    """List the niches the engine understands."""
+    from trend_scraper.niches import all_niches
+    return jsonify({"niches": all_niches()})
 
 
 @app.get("/health")

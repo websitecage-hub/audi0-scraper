@@ -40,11 +40,13 @@ def _split_track(s: str):
 
 
 def _print_table(tracks, top: int) -> None:
-    print(f"\n  TOP {min(top, len(tracks))} TRENDING AUDIO (niche-scored)\n")
-    print(f"  {'#':<3}{'SCORE':<6}{'TRACK':<62}ORIGIN")
-    print("  " + "-" * 96)
+    print(f"\n  TOP {min(top, len(tracks))} TRENDING AUDIO\n")
+    print(f"  {'#':<3}{'SCORE':<7}{'CONF':<6}{'SRC':<5}{'RANK':<6}{'TRACK':<50}GENRE")
+    print("  " + "-" * 104)
     for i, t in enumerate(tracks[:top], 1):
-        print(f"  {i:<3}{t.niche_score:<6}{t.display[:60]:<62}{t.origin_label or 'general'}")
+        genre = t.category.split(":", 1)[1] if ":" in t.category else "-"
+        print(f"  {i:<3}{t.trend_score:<7}{t.confidence:<6}"
+              f"{t.source_count:<5}{t.best_rank or '-':<6}{t.display[:48]:<50}{genre[:20]}")
     print(f"\n  ({len(tracks)} unique tracks. Cache: data/  |  Audio: library/)")
 
 
@@ -52,6 +54,9 @@ def cmd_fetch(args) -> int:
     engine = TrendingAudioEngine(
         cache_dir=None if args.no_cache else DEFAULT_CACHE,
         use_evergreen=not args.no_evergreen,
+        use_charts=not args.no_charts,
+        use_search=not args.no_search,
+        use_stealth=not args.no_stealth,
     )
     niche = Niche.from_name(args.niche)
     tracks = engine.collect(niche, use_cache=not args.no_cache)
@@ -122,6 +127,9 @@ def main(argv=None) -> int:
     f.add_argument("--json", action="store_true")
     f.add_argument("--no-cache", action="store_true")
     f.add_argument("--no-evergreen", action="store_true")
+    f.add_argument("--no-charts", action="store_true", help="skip iTunes/Deezer charts")
+    f.add_argument("--no-search", action="store_true", help="skip search-engine discovery")
+    f.add_argument("--no-stealth", action="store_true", help="never launch a browser")
     f.set_defaults(fn=cmd_fetch)
 
     d = sub.add_parser("download", help="download one track's audio (or a media URL)")

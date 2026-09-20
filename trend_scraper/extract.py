@@ -13,10 +13,27 @@ class Track:
     source: str = "unknown"
     niche_score: int = 0
     origin_label: str = ""   # e.g. "general-trend" or "niche-search"
+    # --- trend-signal fields (populated by the engine / metrics) ---
+    sources: list[str] = field(default_factory=list)   # every independent source
+    best_rank: int = 0                                  # best list position seen
+    list_size: int = 0                                  # size of that list
+    current_hits: int = 0                               # hits on CURRENT feeds
+    total_hits: int = 1                                 # total mentions
+    relevance: float = 0.0                              # 0..1 niche relevance
+    trend_score: float = 0.0                            # 0..100 composite
+    confidence: float = 0.0                             # 0..1 evidence strength
+    last_seen: str = ""                                 # ISO date
+    first_seen: str = ""
+    sample_url: str = ""                                # a page where it appeared
+    category: str = "audio"                             # instagram "reel audio" vs song
 
     @property
     def display(self) -> str:
         return f"{self.title} — {self.artist}" if self.artist else self.title
+
+    @property
+    def source_count(self) -> int:
+        return len(self.sources)
 
     def __hash__(self):
         return hash((self.title.lower(), self.artist.lower()))
@@ -27,54 +44,8 @@ class Track:
 
 
 # ---- niches ----------------------------------------------------------------
-@dataclass
-class Niche:
-    name: str
-    queries: list[str] = field(default_factory=list)
-    mood_words: list[str] = field(default_factory=list)   # title/artist lexicon boost
-    context_words: list[str] = field(default_factory=list)  # words found near tracks on-page
-
-    @classmethod
-    def default(cls) -> "Niche":
-        return cls(name="motivation", queries=["motivation", "motivational"])
-
-    @classmethod
-    def from_name(cls, name: str) -> "Niche":
-        n = name.strip().lower()
-        if any(k in n for k in ("self", "growth", "improvement", "selfhelp", "habit")):
-            return cls(
-                name=name,
-                queries=[n, "self improvement", "personal growth", "discipline"],
-                mood_words=["rise", "strong", "better", "believe", "glorious", "fire",
-                            "mountain", "dream", "high", "best", "inner", "light",
-                            "calm", "reflect", "good"],
-                context_words=["self improvement", "personal growth", "habit", "discipline",
-                               "mindset", "routine", "discipline", "growth"],
-            )
-        if any(k in n for k in ("gym", "fitness", "workout", "body", "sport")):
-            return cls(
-                name=name,
-                queries=[n, "gym reels audio", "workout motivation music"],
-                mood_words=["tiger", "eye", "fight", "strong", "titanium", "beast",
-                            "champion", "level", "power", "hustle", "grind", "dope"],
-                context_words=["gym", "workout", "fitness", "gains", "training", "grind"],
-            )
-        if any(k in n for k in ("money", "business", "entrepreneur", "finance", "hustle")):
-            return cls(
-                name=name,
-                queries=[n, "business motivation reels audio", "hustle reels songs"],
-                mood_words=["money", "hustle", "grind", "empire", "boss", "maker",
-                            "level", "champion", "success", "flex"],
-                context_words=["business", "money", "entrepreneur", "hustle", "success", "grind"],
-            )
-        # fall back to generic motivation
-        return cls(
-            name=name,
-            queries=[n, "motivation reels audio", "motivational songs reels"],
-            mood_words=["rise", "strong", "believer", "fire", "mountain", "fight",
-                        "tiger", "dream", "glorious", "great", "power", "level"],
-            context_words=[n, "motivation", "inspire", "success"],
-        )
+# Niche now lives in .niches (full registry); re-exported here for compatibility.
+from .niches import Niche, resolve  # noqa: E402  (after Track to avoid cycles)
 
 
 # ---- html -> text ----------------------------------------------------------
@@ -91,8 +62,9 @@ _SEP = r"(?:\u2014|\u2013|–|—|-|ft\.|feat\.|featuring)"
 
 # A track entry lives at the START of a line, optionally prefixed by a list
 # number and/or an opening quote:   "8. 'Ain't No Mountain High Enough' — Marvin Gaye"
-_LINE_HEAD = r"(?P<pre>(?:^|[\n\r])\s*(?:\#\d+[\.\):]\s*)?['\"\u201c\u2018]*)"
-# NOTE: verbose mode makes bare '#' a comment, so escape it above as literal safely.
+_LINE_HEAD = r"(?P<pre>(?:^|[\n\r])\s*(?:\#?\d{1,3}[\.\):]\s*)?['\"\u201c\u2018]*)"
+# NOTE: verbose mode makes bare '#' a comment, so escape it above as \# .
+# Accepts both "1. " and "#1. " list prefixes.
 
 _TRACK_RE = re.compile(
     rf"""(?ix)
@@ -137,19 +109,46 @@ def extract_tracks(raw: bytes | str, source: str, *, min_len: int = 3,
     """Extract 'Title — Artist' style audio entries from a page's text.
 
     Matches are anchored to line starts (list entries) and pass a capitalization
-    + prose-blacklist check so we skip article sentences and headlines.
+    + prose-blacklist check so we skip article sentences and headlines. When an
+    entry is prefixed by a list number ("8. Song — Artist") that position is kept
+    as `best_rank`, which the scorer rewards.
     """
     text = _to_text(raw)
     found: dict[tuple[str, str], Track] = {}
-    for m in _TRACK_RE.finditer(text):
+    for idx, m in enumerate(_TRACK_RE.finditer(text)):
         title = _clean_tok(m.group("title")).strip().rstrip("'\"\u2019\u201d")
         artist = _clean_tok(m.group("artist")).strip()
         if not _looks_like_track(title, artist, min_len, max_len):
             continue
         key = (title.lower(), artist.lower())
         if key not in found:
-            found[key] = Track(title=title, artist=artist, source=source)
+            tr = Track(title=title, artist=artist, source=source)
+            tr.sample_url = source
+            rank = _rank_from_prefix(m.group("pre") or "")
+            tr.best_rank = rank or (idx + 1)   # fall back to appearance order
+            tr.sources = [source]
+            found[key] = tr
     return list(found.values())
+
+
+_NUM_PREFIX_RE = re.compile(r"#?(\d{1,3})\s*[\.\):]")
+
+
+def _rank_from_prefix(prefix: str) -> int:
+    """Pull a list position out of a prefix like '  8. ' or '#12) '."""
+    m = _NUM_PREFIX_RE.search(prefix or "")
+    return int(m.group(1)) if m else 0
+
+
+# Lowercase function words that legitimately appear mid-title in real songs
+# ("Eye of the Tiger", "Break in the Clouds"). They must not break the
+# capitalization gate that separates titles from prose.
+_STOPWORDS = {
+    "of", "the", "a", "an", "to", "in", "on", "and", "or", "my", "me", "you",
+    "your", "is", "it", "at", "for", "with", "by", "from", "as", "be", "we",
+    "us", "our", "no", "not", "so", "if", "up", "out", "into", "over", "all",
+    "i", "dont", "don't", "cant", "can't", "wont", "won't", "im", "i'm",
+}
 
 
 def _looks_like_track(title: str, artist: str, min_len: int, max_len: int) -> bool:
@@ -165,14 +164,17 @@ def _looks_like_track(title: str, artist: str, min_len: int, max_len: int) -> bo
     blob = f"{title} {artist}".lower()
     if any(p in blob for p in _PROSE_SUBSTR):
         return False
-    # every significant word in title should be capitalized => track-like, not prose.
-    words = re.findall(r"[A-Za-z][A-Za-z'’]*", title)
-    if len(words) >= 3:
+    # Significant title words (excluding lowercase function words) should be
+    # capitalized => track-like, not prose.
+    words = [w for w in re.findall(r"[A-Za-z][A-Za-z'’]*", title)
+             if w.lower() not in _STOPWORDS]
+    if len(words) >= 2:
         cap = sum(1 for w in words if w[0].isupper())
-        if cap < max(2, len(words) - 1):   # e.g. missing on 2+ of several words -> prose
+        if cap < len(words):   # any significant word lowercase => prose
             return False
     # artist should be capitalized too (except known lowercase markers).
-    aw = re.findall(r"[A-Za-z][A-Za-z'’]*", artist)
+    aw = [w for w in re.findall(r"[A-Za-z][A-Za-z'’]*", artist)
+          if w.lower() not in _STOPWORDS]
     if aw and aw[0][0].islower() and "original audio" not in artist.lower():
         return False
     return True
@@ -187,13 +189,28 @@ def _clean_tok(tok: str) -> str:
     return tok
 
 
+def relevance_score(track: "Track", niche: Niche) -> float:
+    """0..1 niche relevance from the niche's lexicons.
+
+    Weighted: a mood-word hit (the song's vibe matches the niche) counts more
+    than a context-word hit (the page mentions the niche). Normalised against a
+    reference so a strong match lands near 1.0.
+    """
+    blob = f"{track.title} {track.artist}".lower()
+    mood = sum(1 for w in niche.mood_words if w in blob)
+    ctx = sum(1 for w in niche.context_words if w in blob)
+    q = 1 if any(w in blob for w in niche.queries if w) else 0
+    raw = mood * 2.0 + ctx * 1.0 + q * 1.0
+    return min(1.0, raw / 6.0)   # ~3 mood hits => saturated
+
+
 def score_tracks(tracks: list[Track], niche: Niche) -> list[Track]:
-    """Niche-score tracks by title/artist lexicon and fetch each page's context words."""
-    scored: list[Track] = []
+    """Legacy helper: attach an integer niche_score + 0..1 relevance to each track.
+
+    The engine now uses `relevance_score` directly when computing composite
+    trend scores; this stays for the CLI's simple niche_score display.
+    """
     for tr in tracks:
-        blob = f"{tr.title} {tr.artist}".lower()
-        hits = sum(1 for w in niche.mood_words if w in blob)
-        ctx_hits = sum(1 for w in niche.context_words if w in blob)
-        tr.niche_score = hits * 2 + ctx_hits + (1 if any(w in blob for w in niche.queries) else 0)
-        scored.append(tr)
-    return scored
+        tr.relevance = relevance_score(tr, niche)
+        tr.niche_score = int(round(tr.relevance * 10))
+    return tracks
