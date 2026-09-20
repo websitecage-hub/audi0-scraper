@@ -52,6 +52,26 @@ def _write_cookies(cookies: dict | None) -> str | None:
     return path
 
 
+@app.get("/")
+def index():
+    return jsonify({
+        "service": "trending-audio-api",
+        "status": "ok",
+        "docs": "USAGE.md in the repo",
+        "endpoints": {
+            "health": "GET /health",
+            "download": "POST /v1/download  {url, niche?, title?, artist?, cookies?}",
+            "library": "GET /v1/library/<niche>",
+            "file": "GET /v1/file/<niche>/<filename>",
+        },
+    })
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return ("", 204)
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "library": app.config["LIBRARY"]})
