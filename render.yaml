@@ -1,0 +1,29 @@
+# Render Blueprint — deploys the API as a Docker web service with a persistent disk.
+# Push the repo (GitHub/GitLab), then either:
+#   - connect the repo in the Render dashboard (Blueprint -> New Blueprint), or
+#   - use the Render API: POST /v1/services with this file's values (see README).
+#
+# Note: Render persistent disks are only included on paid plans. On the free plan,
+# remove the `disk:` block below — the service still runs, but /data won't persist
+# between deploys/restarts.
+
+services:
+  - type: web
+    name: trending-audio-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: TL_LIBRARY
+        value: /data
+      - key: PORT
+        value: 8000
+      - key: TL_MAX_LIBRARY_MB
+        value: "700"
+      - key: TL_MAX_CONCURRENT
+        value: "2"
+    disk:
+      name: audio
+      mountPath: /data
+      sizeGB: 1

@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      TL_LIBRARY: /data
+      PORT: "8000"
+    volumes:
+      - audio_data:/data
+    restart: unless-stopped
+
+volumes:
+  audio_data:
