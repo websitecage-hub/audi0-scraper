@@ -516,22 +516,20 @@ class SongSearchProvider:
     # -- name -> candidate source URLs -------------------------------------
     def _archive_urls(self, term: str, limit: int = 6) -> list:
         """Internet Archive audio search (works from datacenter IPs)."""
-        import requests
+        from .. import std_http
         out = []
         try:
-            r = requests.get("https://archive.org/advancedsearch.php",
-                             params={"q": f'({term}) AND mediatype:audio',
+            r = std_http.get("https://archive.org/advancedsearch.php",
+                             params={"q": f"({term}) AND mediatype:audio",
                                      "fl[]": "identifier", "rows": limit * 2,
-                                     "output": "json"},
-                             headers={"User-Agent": _UA}, timeout=60)
+                                     "output": "json"}, timeout=60)
             docs = (((r.json() or {}).get("response") or {}).get("docs")) or []
             for doc in docs:
                 ident = doc.get("identifier")
                 if not ident:
                     continue
                 try:
-                    meta = requests.get(f"https://archive.org/metadata/{ident}",
-                                        headers={"User-Agent": _UA},
+                    meta = std_http.get(f"https://archive.org/metadata/{ident}",
                                         timeout=60).json()
                 except Exception:  # noqa: BLE001
                     continue
@@ -549,11 +547,10 @@ class SongSearchProvider:
     def _soundcloud_urls(self, term: str, limit: int = 4) -> list:
         """Resolve name -> SoundCloud track URLs via the public search page."""
         import re
-        import requests
+        from .. import std_http
         try:
-            r = requests.get("https://soundcloud.com/search/sounds",
-                             params={"q": term},
-                             headers={"User-Agent": _UA}, timeout=60)
+            r = std_http.get("https://soundcloud.com/search/sounds",
+                             params={"q": term}, timeout=60)
             if r.status_code != 200:
                 return []
             slugs = re.findall(r'href="(/[a-z0-9_\-]+/[a-z0-9_\-]+)"', r.text)
