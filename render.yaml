@@ -19,8 +19,14 @@ services:
         value: /data
       - key: PORT
         value: 8000
+      # Cap sits well under the 1GB disk: the container image, ffmpeg work files
+      # and a partial download all live on the same volume, so a 700MB cap could
+      # still hit ENOSPC mid-write and kill the service.
       - key: TL_MAX_LIBRARY_MB
-        value: "700"
+        value: "600"
+      # Refuse a new download when less than this is free.
+      - key: TL_MIN_FREE_MB
+        value: "80"
       - key: TL_MAX_CONCURRENT
         value: "2"
     disk:

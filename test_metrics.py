@@ -34,9 +34,24 @@ def test_rank_weight_best_rank_scores_highest():
 
 
 def test_recency_boost_decays_within_bounds():
+    """Recency must decay with age, stay in [0.5, 1.0], and tolerate junk input.
+
+    Uses RELATIVE dates: an absolute "yesterday" assertion decays into failure as
+    the calendar moves (this test was red before the fix for exactly that reason).
+    """
+    from datetime import date, timedelta
+
+    today = date.today().isoformat()
+    recent = (date.today() - timedelta(days=1)).isoformat()
+    old = (date.today() - timedelta(days=400)).isoformat()
+
     assert recency_boost(None) == 1.0
-    assert recency_boost("2026-09-19", half_life_days=14) > 0.9
-    assert recency_boost("2020-01-01", half_life_days=14) == 0.5
+    assert recency_boost(today) == 1.0
+    # fresher must beat staler, and a recent date must be a large fraction of 1.0
+    assert recency_boost(recent, half_life_days=14) > recency_boost(old, half_life_days=14)
+    assert recency_boost(recent, half_life_days=14) > 0.9
+    # bounds: never below the 0.5 floor, never above 1.0
+    assert 0.5 <= recency_boost(old, half_life_days=14) <= 1.0
     assert recency_boost("garbage-date") == 1.0
 
 

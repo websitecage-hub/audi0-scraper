@@ -1,7 +1,8 @@
 from .providers import (YouTubeAudioProvider, SoundCloudAudioProvider,
-                        InstagramReelProvider, UrlAudioProvider, DownloadResult)
+                        InstagramReelProvider, UrlAudioProvider, SongSearchProvider,
+                        DownloadResult, SongTrack)
 from .library import AudioLibrary
 
 __all__ = ["YouTubeAudioProvider", "SoundCloudAudioProvider",
-           "InstagramReelProvider", "UrlAudioProvider", "DownloadResult",
-           "AudioLibrary"]
+           "InstagramReelProvider", "UrlAudioProvider", "SongSearchProvider",
+           "DownloadResult", "SongTrack", "AudioLibrary"]

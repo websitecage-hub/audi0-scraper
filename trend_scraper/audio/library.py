@@ -16,7 +16,8 @@ import threading
 from datetime import date
 
 from .providers import (YouTubeAudioProvider, SoundCloudAudioProvider,
-                        InstagramReelProvider, UrlAudioProvider)
+                        InstagramReelProvider, UrlAudioProvider, SongSearchProvider,
+                        probe_duration, source_key, AUDIO_EXTS)
 
 log = logging.getLogger("trend.audio.library")
 
@@ -135,9 +136,24 @@ class AudioLibrary:
 
         Returns a manifest entry dict. If title/artist are not supplied they're
         read from the media's metadata.
+
+        Storage discipline: one entry per source URL. Re-requesting a URL that is
+        already on disk (and still valid) returns the existing entry without
+        downloading or adding a manifest row — previously every call appended a
+        duplicate row plus a duplicate file, which is how the library filled up.
         """
         folder = os.path.join(self.root, _safe_folder(niche))
         os.makedirs(folder, exist_ok=True)
+
+        from .providers import source_sha256 as _sha
+
+        sha = _sha(url)
+        with _MANIFEST_LOCK:
+            entries = self._load_manifest(niche)
+            for e in entries:
+                if e.get("sha256") == sha and e.get("ok") and os.path.isfile(e.get("path", "")):
+                    return {**e, "reused": True}
+
         prov = UrlAudioProvider(cookies_file=self.cookies, quality=self.quality)
         res = prov.download(url, folder)
         entry = {
@@ -150,9 +166,96 @@ class AudioLibrary:
             "message": res.message,
             "webpage": res.webpage,
             "source_url": url,
+            # provenance: lets callers (and this library) prove which source a
+            # file came from instead of trusting a filename
+            "sha256": res.source_sha256,
+            "source_key": res.source_key,
+            "bytes": res.bytes,
+            "duration_s": round(res.duration_s, 2),
+            "cached": res.cached,
             "downloaded": date.today().isoformat(),
         }
         if res.ok:
+            with _MANIFEST_LOCK:
+                entries = self._load_manifest(niche)
+                # replace any stale row for this source rather than appending a dup
+                entries = [e for e in entries if e.get("sha256") != res.source_sha256]
+                entries.append(entry)
+                self._save_manifest(niche, entries)
+            self._prune()
+        return entry
+
+    # ---- song-by-name (trending track -> audio, Instagram-first) -------------
+    def download_song(self, title: str, artist: str = "", niche: str = "reels",
+                      instagram_url: str | None = None) -> dict:
+        """Resolve a song NAME (e.g. straight from /v1/trending) to audio.
+
+        Order:
+          1. an explicit Instagram URL/reel when the caller has one
+          2. Instagram audio-page search for the trending sound name
+          3. SoundCloud, then YouTube, for the plain song name
+
+        Step 1-2 need session cookies; without them Instagram is skipped rather
+        than burning the request, and the name search carries it.
+        """
+        folder = os.path.join(self.root, _safe_folder(niche))
+        os.makedirs(folder, exist_ok=True)
+        attempts = []
+
+        if instagram_url:
+            ig = InstagramReelProvider(cookies_file=self.cookies)
+            res = ig.download(instagram_url, None, folder)
+            attempts.append({"source": "instagram_url", "ok": res.ok,
+                             "message": res.message})
+            if res.ok:
+                return self._record_entry(niche, title, artist, res, instagram_url)
+
+        if self.cookies:
+            ig = InstagramReelProvider(cookies_file=self.cookies)
+            res = ig.download_sound(title, artist, folder)
+            attempts.append({"source": "instagram_search", "ok": res.ok,
+                             "message": res.message})
+            if res.ok:
+                return self._record_entry(niche, title, artist, res, "")
+        else:
+            attempts.append({"source": "instagram_search", "ok": False,
+                             "message": "skipped: no cookies supplied"})
+
+        from .providers import SongTrack
+
+        res = SongSearchProvider(quality=self.quality).download(
+            SongTrack(title=title, artist=artist), folder)
+        attempts.append({"source": "songsearch", "ok": res.ok,
+                         "message": res.message})
+        entry = self._record_entry(niche, title, artist, res, "")
+        entry["attempts"] = attempts
+        return entry
+
+    def _record_entry(self, niche: str, title: str, artist: str, res, source: str) -> dict:
+        path = getattr(res, "path", "") or ""
+        size = 0
+        if path and os.path.isfile(path):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+        # Measure provenance here rather than trusting the provider: the search
+        # providers don't carry bytes/duration, and a manifest with a 0-byte or
+        # 0-second row is how "storage in mind" silently breaks.
+        dur = probe_duration(path) if path and os.path.isfile(path) else 0.0
+        entry = {
+            "title": title, "artist": artist, "niche": niche,
+            "path": path, "provider": getattr(res, "provider", ""),
+            "ok": bool(getattr(res, "ok", False)),
+            "message": getattr(res, "message", ""),
+            "source_url": source or "",
+            "sha256": getattr(res, "source_sha256", ""),
+            "source_key": getattr(res, "source_key", "") or (source_key(source) if source else ""),
+            "bytes": size or getattr(res, "bytes", 0),
+            "duration_s": round(dur or (getattr(res, "duration_s", 0.0) or 0.0), 2),
+            "downloaded": date.today().isoformat(),
+        }
+        if entry["ok"]:
             with _MANIFEST_LOCK:
                 entries = self._load_manifest(niche)
                 entries.append(entry)
@@ -161,32 +264,88 @@ class AudioLibrary:
         return entry
 
     # -- storage cap (keep the free-tier disk from filling up) ------------------
-    def _prune(self) -> None:
-        """If the library exceeds max_bytes, delete the oldest audio files until under.
-
-        Free tiers (Render free) have no persistent disk — this stops the ephemeral
-        disk from filling and crashing the service. Adjust the cap via TL_MAX_LIBRARY_MB.
-        """
+    def _audio_files(self) -> list[tuple[float, str, int]]:
+        """Every audio file under the library root: (mtime, path, bytes)."""
         files = []
-        total = 0
         for dirpath, _, fnames in os.walk(self.root):
             for f in fnames:
+                if f.rsplit(".", 1)[-1].lower() not in AUDIO_EXTS:
+                    continue
                 p = os.path.join(dirpath, f)
                 try:
-                    sz = os.path.getsize(p)
+                    files.append((os.path.getmtime(p), p, os.path.getsize(p)))
                 except OSError:
                     continue
-                files.append((os.path.getmtime(p), p, sz))
-                total += sz
-        if total <= self.max_bytes:
-            return
-        files.sort()  # oldest first by mtime
-        for _, path, sz in files:
-            if total <= self.max_bytes:
-                break
-            try:
-                os.remove(path)
-                total -= sz
-                log.info("pruned %s to stay under library cap", path)
-            except OSError:
-                continue
+        return files
+
+    def stats(self) -> dict:
+        """Disk accounting for the library — used by /health and before downloads."""
+        files = self._audio_files()
+        total = sum(sz for _, _, sz in files)
+        return {"files": len(files), "bytes": total,
+                "mb": round(total / 1048576, 2),
+                "cap_mb": round(self.max_bytes / 1048576, 2),
+                "over_cap": total > self.max_bytes}
+
+    def _drop_manifest_rows(self, *, paths: set[str] | None = None,
+                            keep: set[str] | None = None) -> None:
+        """Drop manifest rows whose file is gone (or that aren't in `keep`)."""
+        with _MANIFEST_LOCK:
+            for dirpath, _, fnames in os.walk(self.root):
+                if "manifest.json" not in fnames:
+                    continue
+                mp = os.path.join(dirpath, "manifest.json")
+                try:
+                    rows = json.load(open(mp))
+                except Exception:
+                    continue
+                kept = [e for e in rows
+                        if (keep is not None and e.get("path") in keep)
+                        or (keep is None and e.get("path")
+                            and os.path.isfile(e.get("path", "")))]
+                if len(kept) != len(rows):
+                    with open(mp, "w") as fh:
+                        json.dump(kept, fh, indent=2, ensure_ascii=False)
+
+    def _prune(self) -> None:
+        """Keep the library under `max_bytes` by dropping the OLDEST tracks.
+
+        Prunes whole tracks (file + its manifest row) oldest-first until the cap
+        is met, and always removes manifest rows whose file has vanished. The cap
+        must leave headroom: this runs mid-request, so a runaway library would
+        otherwise fill the disk before the next prune.
+        """
+        files = self._audio_files()
+        total = sum(sz for _, _, sz in files)
+        removed = 0
+        if total > self.max_bytes:
+            # Never prune the file we just wrote: newest mtime is kept.
+            files.sort()                      # oldest first
+            for _, path, sz in files[:-1]:    # last entry = newest = keep
+                if total <= self.max_bytes:
+                    break
+                try:
+                    os.remove(path)
+                    total -= sz
+                    removed += 1
+                    log.info("pruned %s to stay under library cap", path)
+                except OSError:
+                    continue
+        # Drop manifest rows pointing at files that no longer exist.
+        with _MANIFEST_LOCK:
+            for dirpath, _, fnames in os.walk(self.root):
+                if "manifest.json" not in fnames:
+                    continue
+                mp = os.path.join(dirpath, "manifest.json")
+                try:
+                    rows = json.load(open(mp))
+                except Exception:
+                    continue
+                kept = [e for e in rows
+                        if e.get("path") and os.path.isfile(e.get("path", ""))]
+                if len(kept) != len(rows):
+                    with open(mp, "w") as fh:
+                        json.dump(kept, fh, indent=2, ensure_ascii=False)
+        if removed:
+            log.info("prune removed %d file(s); library now %.1fMB",
+                     removed, total / 1048576)
