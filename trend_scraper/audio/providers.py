@@ -40,6 +40,8 @@ log = logging.getLogger("trend.audio.download")
 
 AUDIO_EXTS = ("mp3", "m4a", "opus", "webm", "aac", "ogg", "wav")
 MIN_AUDIO_BYTES = 10 * 1024          # anything smaller is a failed/empty fetch
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/121.0 Safari/537.36")
 
 # One lock per output stem: two requests for the SAME source must not both run
 # yt-dlp against one destination (they would clobber each other's file).
@@ -496,10 +498,13 @@ class InstagramReelProvider:
 
 
 class SongSearchProvider:
-    """Resolve ANY song by name to audio, trying several sources in order.
+    """Resolve ANY song by name to audio.
 
-    Used when the caller has a track title/artist (typically straight from the
-    trending API) and no direct URL.
+    `ytsearch1:` / `scsearch1:` search prefixes are blocked from datacenter IPs
+    (verified against the deployed service: direct YouTube/SoundCloud URLs return
+    ok, the search prefixes return "no source had ..."). So this provider does NOT
+    rely on yt-dlp's search — it resolves the name to candidate SOURCE URLs via
+    public search endpoints, then downloads those URLs directly.
     """
 
     name = "songsearch"
@@ -508,58 +513,85 @@ class SongSearchProvider:
         self.quality = quality
         self.ffmpeg = ffmpeg or "ffmpeg"
 
+    # -- name -> candidate source URLs -------------------------------------
+    def _archive_urls(self, term: str, limit: int = 6) -> list:
+        """Internet Archive audio search (works from datacenter IPs)."""
+        import requests
+        out = []
+        try:
+            r = requests.get("https://archive.org/advancedsearch.php",
+                             params={"q": f'({term}) AND mediatype:audio',
+                                     "fl[]": "identifier", "rows": limit * 2,
+                                     "output": "json"},
+                             headers={"User-Agent": _UA}, timeout=60)
+            docs = (((r.json() or {}).get("response") or {}).get("docs")) or []
+            for doc in docs:
+                ident = doc.get("identifier")
+                if not ident:
+                    continue
+                try:
+                    meta = requests.get(f"https://archive.org/metadata/{ident}",
+                                        headers={"User-Agent": _UA},
+                                        timeout=60).json()
+                except Exception:  # noqa: BLE001
+                    continue
+                for f in (meta.get("files") or []):
+                    nm = str(f.get("name") or "")
+                    if nm.lower().endswith((".mp3", ".m4a", ".ogg")):
+                        out.append(f"https://archive.org/download/{ident}/{nm}")
+                        break
+                if len(out) >= limit:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            log.debug("archive search failed for %r: %s", term, exc)
+        return out
+
+    def _soundcloud_urls(self, term: str, limit: int = 4) -> list:
+        """Resolve name -> SoundCloud track URLs via the public search page."""
+        import re
+        import requests
+        try:
+            r = requests.get("https://soundcloud.com/search/sounds",
+                             params={"q": term},
+                             headers={"User-Agent": _UA}, timeout=60)
+            if r.status_code != 200:
+                return []
+            slugs = re.findall(r'href="(/[a-z0-9_\-]+/[a-z0-9_\-]+)"', r.text)
+            seen, out = set(), []
+            for s in slugs:
+                if s in seen or s.startswith(("/search", "/you", "/charts", "/pages")):
+                    continue
+                seen.add(s)
+                out.append(f"https://soundcloud.com{s}")
+                if len(out) >= limit:
+                    break
+            return out
+        except Exception as exc:  # noqa: BLE001
+            log.debug("soundcloud search failed for %r: %s", term, exc)
+            return []
+
     def download(self, track, dest_dir: str) -> DownloadResult:
         title = getattr(track, "title", "") or ""
         artist = getattr(track, "artist", "") or ""
         if not title:
             return DownloadResult(ok=False, provider=self.name,
                                   message="no title to search")
-        safe = _safe_name(title, artist)
         term = f"{title} {artist}".strip()
-        # Ordered sources: SoundCloud is the least bot-walled, then YouTube.
-        attempts = [
-            ("scsearch1", "soundcloud"),
-            ("ytsearch5", "youtube"),
-        ]
-        for prefix, source in attempts:
-            stem = stem_for(f"{safe}-{source}", term)
-            lock = _lock_for(stem)
-            with lock:
-                existing = resolve_download(dest_dir, stem)
-                if existing and verify_audio(existing)[0]:
-                    return DownloadResult(ok=True, path=existing, provider=self.name)
-                opts = {
-                    "format": "bestaudio/best",
-                    "outtmpl": os.path.join(dest_dir, f"{stem}.%(ext)s"),
-                    "noplaylist": True,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noprogress": True,
-                    "default_search": prefix,
-                    "socket_timeout": 30,
-                    "retries": 3,
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": str(self.quality),
-                    }],
-                }
-                if source == "youtube":
-                    opts["extractor_args"] = {
-                        "youtube": {"player_client": ["android", "ios", "web"]},
-                    }
-                try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.extract_info(f"{prefix}:{term}", download=True)
-                except Exception as exc:
-                    log.debug("%s search failed for %r: %s", source, term, exc)
-                    _cleanup_partials(dest_dir, stem)
-                    continue
-                path = resolve_download(dest_dir, stem)
-                good, why = verify_audio(path)
-                if good:
-                    return DownloadResult(ok=True, path=path, provider=self.name)
-                _cleanup_partials(dest_dir, stem)
-                log.debug("%s verify failed for %r: %s", source, term, why)
+        urls = self._soundcloud_urls(term) + self._archive_urls(term)
+        if not urls:
+            return DownloadResult(ok=False, provider=self.name,
+                                  message=f"no source URLs found for {term!r}")
+
+        prov = UrlAudioProvider(quality=self.quality)
+        errors = []
+        for url in urls[:6]:
+            try:
+                res = prov.download(url, dest_dir)
+                if res.ok:
+                    return DownloadResult(ok=True, path=res.path, provider=self.name)
+                errors.append(f"{url.rsplit('/', 1)[-1][:40]}: {res.message[:60]}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc)[:60])
         return DownloadResult(ok=False, provider=self.name,
-                              message=f"no source had {term!r}")
+                              message=f"tried {len(urls[:6])} urls; "
+                                      f"{'; '.join(errors[:3])}")
