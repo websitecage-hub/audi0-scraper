@@ -163,9 +163,15 @@ runs a live scrape, and returns the new result (via the usual 202 → poll flow,
 with `"message": "Fresh scrape forced (cache bypassed)..."`). The forced scrape
 also skips the per-sound enrichment cache, so usage counts are re-read live.
 
+Call it **once**, then poll the same URL *without* `fresh`. A `fresh` request
+against an entry that is already ready forces yet another scrape — that is what
+"bypass the cache" means — so polling with `fresh=true` would never converge:
+
 ```bash
-curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"   # 202
-curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"   # poll -> ready, new ids
+curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"     # 202, scrape forced
+curl "localhost:8000/v1/trending?keyword=anxiety"               # poll -> ready, NEW ids
+curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"     # 202, force again
+curl "localhost:8000/v1/trending?keyword=anxiety"               # poll -> ready, different mix
 ```
 
 `?refresh=true` is different and still supported: it serves the cached value

@@ -162,12 +162,15 @@ async function run() {
   const kw = $('kw').value.trim() || 'sad';
   const lim = Math.min(50, Math.max(1, parseInt($('limit').value || '20', 10)));
   const tag = $('tag').value.trim();
-  let url = `/v1/trending?keyword=${encodeURIComponent(kw)}&limit=${lim}`;
-  if (tag) url += `&hashtag=${encodeURIComponent(tag)}`;
-  if ($('fresh').checked) url += '&fresh=true';
+  const useFresh = $('fresh').checked;
+  let base = `/v1/trending?keyword=${encodeURIComponent(kw)}&limit=${lim}`;
+  if (tag) base += `&hashtag=${encodeURIComponent(tag)}`;
 
   const t0 = Date.now();
   for (let attempt = 1; attempt <= 30; attempt++) {
+    // fresh only on the first request: a fresh call against an already-ready
+    // entry forces ANOTHER scrape, so polling with it would never converge.
+    const url = attempt === 1 && useFresh ? base + '&fresh=true' : base;
     let r, b;
     try { ({ r, b } = await api(url)); }
     catch (e) { $('status').textContent = 'network error: ' + e; break; }
