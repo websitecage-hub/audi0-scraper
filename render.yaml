@@ -42,11 +42,17 @@ services:
       # How many hashtags one keyword request mines (mapped tags + trending feed).
       - key: TIKTOK_HASHTAG_FANOUT
         value: "3"
-      # Videos pulled per hashtag, and from the trending feed.
+      # Videos pulled per hashtag (verified ceiling: TikTok rejects count=50) and
+      # from the trending feed. 30 x 3 hashtags + trending is the pool.
       - key: TIKTOK_VIDEOS_PER_HASHTAG
-        value: "20"
+        value: "30"
       - key: TIKTOK_TRENDING_COUNT
         value: "20"
+      # Read a random sample of this many videos from the pool before extracting
+      # sounds, so repeat searches return a different mix instead of the same
+      # top videos. 0 = use the whole pool.
+      - key: TIKTOK_POOL_SAMPLE
+        value: "35"
       # How many of the most promising sounds get a /api/music/details call for
       # their real global usage count. ~0.19s per call, verified not to be
       # retired after 25 sequential calls, so this is a latency budget cap.

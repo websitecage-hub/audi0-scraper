@@ -118,7 +118,7 @@ curl -s "http://localhost:8000/v1/trending?keyword=sad&limit=5" | python -m json
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/trending` | Trending sounds. `keyword` (required unless `hashtag`), `limit` (1–50, default 20), `country`, `hashtag`, `refresh` |
+| `GET /v1/trending` | Trending sounds. `keyword` (required unless `hashtag`), `limit` (1–50, default 20), `country`, `hashtag`, `fresh`, `refresh` |
 | `GET /v1/health` | `{"status":"ok", ...}` — GET **and** HEAD, with and without a trailing slash |
 | `GET /health` | Same handler under the plain path — for monitors pointed at `/health` (e.g. UptimeRobot) |
 | `GET /v1/trending/hashtags` | The curated keyword → hashtag map |
@@ -142,6 +142,43 @@ curl -s "http://localhost:8000/v1/trending?keyword=sad&limit=5" | python -m json
 **Stale-while-revalidate**: once a keyword has data, an expired entry is served
 instantly and refreshed behind the request, so a slow refresh never degrades a
 warm keyword back to a 202.
+
+### Repeated searches, and asking for something new
+
+The cache (600 s) means a repeat of the same keyword returns the *same* list —
+that is the point of a cache, but it makes the API look stale when you are
+browsing a niche. Two mechanisms fix that:
+
+**Every scrape reads a random sample of a deeper pool.** The service fetches up
+to 30 videos per hashtag (3 tags) plus the trending feed — a pool of ~110
+videos — then reads a random sample of `TIKTOK_POOL_SAMPLE` (35) of them before
+extracting sounds. So even when the cache *does* expire, the next scrape returns
+a different mix of the same niche rather than the same top three videos.
+`meta.videos_fetched` is the pool; `meta.videos_sampled` is what was read.
+30 per hashtag is a verified ceiling — TikTok answers `count=30` with 30 videos
+but rejects `count=50`, so `TIKTOK_VIDEOS_PER_HASHTAG` is hard-capped there.
+
+**`?fresh=true` bypasses the cache entirely.** It ignores whatever is cached,
+runs a live scrape, and returns the new result (via the usual 202 → poll flow,
+with `"message": "Fresh scrape forced (cache bypassed)..."`). The forced scrape
+also skips the per-sound enrichment cache, so usage counts are re-read live.
+
+```bash
+curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"   # 202
+curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"   # poll -> ready, new ids
+```
+
+`?refresh=true` is different and still supported: it serves the cached value
+immediately and refreshes behind the request (stale-while-revalidate).
+
+Two honest trade-offs of `fresh=true`, because the cache is shared per keyword:
+
+* While a forced scrape runs (~5–10 s), that keyword answers `202` to *everyone*,
+  not just the caller who asked for fresh. The cached data is not deleted, so if
+  the forced scrape fails the old list is still served with `meta.refresh_error`.
+* Repeated `?fresh=true` calls in a tight loop therefore coalesce: they are told
+  `processing` rather than each starting their own scrape. Polling always
+  converges.
 
 ### Targeting a niche exactly
 
@@ -222,6 +259,8 @@ schedule if you want it kept warm.
 | `SCRAPE_DEADLINE_SECONDS` | `25` | Hard ceiling on one scrape |
 | `ERROR_RETRY_COOLDOWN_SECONDS` | `60` | How long an errored keyword is served before retrying |
 | `NICHE_PRIORITY` | `1` | Niche-mined sounds outrank trending-feed-only ones, regardless of usage count. `0` = rank purely by count |
+| `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Videos pulled per hashtag. Hard-capped at 30: TikTok rejects `count=50` (verified) |
+| `TIKTOK_POOL_SAMPLE` | `35` | Videos drawn at random from the pool before reading sounds. `0` = read the whole pool |
 | `LOG_LEVEL` | `INFO` | |
 
 ---

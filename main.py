@@ -143,18 +143,23 @@ def _scheduled_locked() -> int:
 # Background scrape
 # ---------------------------------------------------------------------------
 
-def scrape_and_cache(key: str, keyword: str, country: str | None, hashtag: str | None) -> None:
+def scrape_and_cache(key: str, keyword: str, country: str | None, hashtag: str | None,
+                     fresh: bool = False) -> None:
     """Run one scrape and fold the result into the cache.
 
     Runs in a worker thread after the response is sent, so it may take longer
     than the edge timeout. Must never raise: an unhandled exception would leave
     the entry stuck in "processing" until STALE_PROCESSING_SECONDS expires.
+
+    `fresh` (from ?fresh=true) also skips the per-sound enrichment cache, so a
+    forced scrape re-reads usage counts live.
     """
     with _SCRAPE_SEM:
         try:
             started = time.monotonic()
             result = scraper.fetch_trending_sounds(
-                keyword, limit=SCRAPE_LIMIT, country=country, hashtag=hashtag
+                keyword, limit=SCRAPE_LIMIT, country=country, hashtag=hashtag,
+                fresh=fresh,
             )
             with _CACHE_LOCK:
                 entry = CACHE.setdefault(key, _new_entry())
@@ -213,7 +218,8 @@ def trending(
                                 description="2-letter region, forwarded as TikTok's `region`. Content follows this server's egress IP."),
     hashtag: str | None = Query(None,
                                 description="Explicit hashtag(s), comma-separated: 'sad,sadmusic'. Skips the keyword mapping and works on its own."),
-    refresh: bool = Query(False, description="Force a re-scrape even if the cached value is fresh."),
+    refresh: bool = Query(False, description="Refresh in the background while serving the cached value immediately (stale-while-revalidate)."),
+    fresh: bool = Query(False, description="Bypass the cache: force a live scrape now and return the NEW result. Answers 202 until it is ready."),
 ):
     keyword = (keyword or "").strip()
     hashtag = (hashtag or "").strip() or None
@@ -264,7 +270,23 @@ def trending(
 
         elif entry["status"] == "ready" and entry.get("data"):
             age = now - (entry.get("ready_at") or 0)
-            if refresh or age >= CACHE_TTL_SECONDS:
+            if fresh and not entry.get("refreshing"):
+                # ?fresh=true: bypass the cache entirely. The entry goes back to
+                # "processing" so this caller -- and anyone polling -- waits for
+                # the NEW result instead of being handed the same list again.
+                # Existing data is deliberately KEPT: scrape_and_cache falls back
+                # to it (with refresh_error) if the forced scrape fails, so a
+                # transient upstream failure cannot destroy a good cached page.
+                entry["status"] = "processing"
+                entry["state_at"] = now
+                entry["refreshing"] = True
+                schedule = True
+                decision = "fresh-forced"
+            elif fresh:
+                # A forced scrape is already running: report progress instead of
+                # restarting it, so polling converges on the new result.
+                decision = "processing"
+            elif refresh or age >= CACHE_TTL_SECONDS:
                 if not entry.get("refreshing"):
                     entry["refreshing"] = True
                     schedule = True
@@ -284,7 +306,7 @@ def trending(
                 decision = "processing"
 
         elif entry["status"] == "error":
-            if refresh or now - entry["state_at"] >= ERROR_RETRY_COOLDOWN_SECONDS:
+            if fresh or refresh or now - entry["state_at"] >= ERROR_RETRY_COOLDOWN_SECONDS:
                 entry["status"] = "processing"
                 entry["state_at"] = now
                 entry["refreshing"] = True
@@ -303,15 +325,20 @@ def trending(
         scheduled = _scheduled_locked()
 
     if schedule:
-        background_tasks.add_task(scrape_and_cache, key, keyword, country, hashtag)
+        background_tasks.add_task(scrape_and_cache, key, keyword, country, hashtag, fresh)
 
     # -- shape the response --------------------------------------------------
-    if decision in ("cold", "processing", "processing-stale-reschedule", "error-retry"):
+    if decision in ("cold", "processing", "processing-stale-reschedule", "error-retry",
+                    "fresh-forced"):
+        message = (f"Fresh scrape forced (cache bypassed). Poll again in {POLL_AFTER_SECONDS} seconds."
+                   if decision == "fresh-forced"
+                   else f"Scrape started. Poll again in {POLL_AFTER_SECONDS} seconds.")
         return JSONResponse(
             {
                 "status": "processing",
                 "keyword": keyword,
-                "message": f"Scrape started. Poll again in {POLL_AFTER_SECONDS} seconds.",
+                "message": message,
+                "fresh": bool(fresh),
                 "retry_after_seconds": POLL_AFTER_SECONDS,
                 "scrapes_scheduled": scheduled,
                 "max_concurrent_scrapes": MAX_CONCURRENT_SCRAPES,

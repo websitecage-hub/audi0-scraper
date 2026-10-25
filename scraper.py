@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,8 +73,20 @@ EXPLORE_PATH = "/api/explore/item_list/"          # last-resort fallback only
 # Tunables
 # ---------------------------------------------------------------------------
 
-VIDEOS_PER_HASHTAG = int(os.environ.get("TIKTOK_VIDEOS_PER_HASHTAG", "20"))
+# Videos requested per hashtag. VERIFIED ceiling: /api/challenge/item_list/
+# honours count=30 (30 videos back) and REJECTS count=50 outright
+# (TikTokBadRequest), so 30 is the deepest safe single call. Deeper pools come
+# from more hashtags, not a bigger count.
+MAX_VIDEOS_PER_HASHTAG = 30
+VIDEOS_PER_HASHTAG = min(int(os.environ.get("TIKTOK_VIDEOS_PER_HASHTAG", "30")),
+                         MAX_VIDEOS_PER_HASHTAG)
 TRENDING_COUNT = int(os.environ.get("TIKTOK_TRENDING_COUNT", "20"))
+
+# Sample this many videos at random from the whole fetched pool before reading
+# their sounds. Without it every scrape reads the same top videos and returns
+# an identical list; with it, a repeat search (or ?fresh=true) yields a
+# different mix of the same niche. 0 disables sampling (use the whole pool).
+POOL_SAMPLE = int(os.environ.get("TIKTOK_POOL_SAMPLE", "35"))
 HASHTAG_FANOUT = int(os.environ.get("TIKTOK_HASHTAG_FANOUT", "3"))
 MAX_WORKERS = int(os.environ.get("TIKTOK_MAX_WORKERS", "4"))
 ENRICH_WORKERS = int(os.environ.get("TIKTOK_ENRICH_WORKERS", "6"))
@@ -391,11 +404,16 @@ _music_cache: dict[str, tuple[float, dict]] = {}
 _music_lock = threading.Lock()
 
 
-def music_details(music_id: str, deadline: float, country=None) -> dict | None:
+def music_details(music_id: str, deadline: float, country=None,
+                  fresh: bool = False) -> dict | None:
     """Full sound object: play_link, duration_seconds and the REAL video_count.
 
     This is the endpoint the original build wrongly declared unobtainable.
     Returns None on failure so one bad sound cannot sink the batch.
+
+    `fresh` skips the cache read (the write still happens), so a forced
+    ?fresh=true scrape re-reads usage counts live instead of reusing values
+    cached by an earlier scrape.
 
     Deliberately NO retry (retries=0), unlike the hashtag/trending calls. Two
     reasons, both learned from live logs: a sound that has been deleted answers
@@ -405,10 +423,11 @@ def music_details(music_id: str, deadline: float, country=None) -> dict | None:
     better handled by the next scrape 10 minutes later than by sleeping here.
     """
     key = str(music_id)
-    with _music_lock:
-        hit = _music_cache.get(key)
-        if hit and hit[0] > time.time():
-            return hit[1]
+    if not fresh:
+        with _music_lock:
+            hit = _music_cache.get(key)
+            if hit and hit[0] > time.time():
+                return hit[1]
 
     try:
         payload = _call(MUSIC_DETAIL_PATH, {"musicId": key},
@@ -513,8 +532,14 @@ def _order_key(r: dict):
 # Public API
 # ---------------------------------------------------------------------------
 
-def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadline=None):
+def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadline=None,
+                          fresh=False):
     """Return trending sounds for a keyword/niche.
+
+    `fresh` skips the per-sound enrichment cache, so usage counts are re-read
+    live rather than reused from a previous scrape. The video pool is always
+    fetched live and sampled at random, so two scrapes of the same keyword
+    return a different mix even without this flag.
 
     Raises ScrapeError only when NO source produced data. Partial failures are
     reported in `meta.sources_failed`.
@@ -568,20 +593,28 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         detail = "; ".join(f"{f['source']}: {f['error']}" for f in failed) or "no sources"
         raise ScrapeError(f"no sounds found for {keyword!r} ({detail})")
 
-    # --- 4. dedupe by music id -------------------------------------------
+    # --- 4. sample the pool at random ------------------------------------
+    # Sampling happens across the whole pool (every hashtag plus the trending
+    # feed) so repeated searches surface different sounds instead of the same
+    # top videos. Labels ride along with each video, so a sampled video keeps
+    # its real source and `is_niche` stays correct.
+    pool = [(label, video) for label, videos in sources for video in videos]
+    videos_fetched = len(pool)
+    if POOL_SAMPLE and len(pool) > POOL_SAMPLE:
+        pool = random.sample(pool, POOL_SAMPLE)
+    videos_sampled = len(pool)
+
+    # --- 5. dedupe by music id -------------------------------------------
     by_music: dict[str, dict] = {}
-    videos_sampled = 0
-    for label, videos in sources:
-        videos_sampled += len(videos)
-        for video in videos:
-            music = video.get("music")
-            if not isinstance(music, dict) or not music.get("id"):
-                continue
-            key = str(music["id"])            # dedupe by id; by title would merge
-            acc = by_music.setdefault(              # distinct sounds sharing a title
-                key, {"music": music, "videos": [], "sources": set()})
-            acc["videos"].append(video)
-            acc["sources"].add(label)
+    for label, video in pool:
+        music = video.get("music")
+        if not isinstance(music, dict) or not music.get("id"):
+            continue
+        key = str(music["id"])                # dedupe by id; by title would merge
+        acc = by_music.setdefault(            # distinct sounds sharing a title
+            key, {"music": music, "videos": [], "sources": set()})
+        acc["videos"].append(video)
+        acc["sources"].add(label)
 
     if not by_music:
         raise ScrapeError(f"no sounds found for {keyword!r} (videos had no music objects)")
@@ -595,7 +628,7 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
     enriched_map: dict[str, dict] = {}
     if to_enrich and time.monotonic() < deadline - 2:
         with ThreadPoolExecutor(max_workers=min(ENRICH_WORKERS, len(to_enrich))) as pool:
-            futures = {pool.submit(music_details, key, deadline, country): key
+            futures = {pool.submit(music_details, key, deadline, country, fresh=fresh): key
                        for key, _acc in to_enrich}
             for future in as_completed(futures):
                 key = futures[future]
@@ -639,7 +672,10 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         "sources": [label for label, _v in sources],
         "sources_failed": failed,
         "fallback_used": fallback_used,
+        "videos_fetched": videos_fetched,
         "videos_sampled": videos_sampled,
+        "pool_sample": POOL_SAMPLE or None,
+        "fresh": bool(fresh),
         "sounds_considered": len(records),
         "sounds_enriched": len(enriched_map),
         "sounds_with_usage_count": with_count,
@@ -665,6 +701,10 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
             "this service's own TTL.",
             "Feed content follows this server's egress IP, not the ?country= value. On "
             "Render (Oregon) results are US-skewed; from an Asian egress they are Asian.",
+            f"videos_fetched is the whole pool; videos_sampled is the random sample "
+            f"({POOL_SAMPLE or 'all'}) actually read for sounds, which is why a repeat "
+            "search of the same keyword returns a different mix. Pass ?fresh=true to "
+            "force a new scrape instead of waiting out the cache TTL.",
         ],
     }
     return {"sounds": selected, "meta": meta}

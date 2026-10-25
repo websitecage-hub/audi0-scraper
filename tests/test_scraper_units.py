@@ -171,6 +171,76 @@ def test_all_niche_results_keep_pure_count_ordering():
     assert [r["id"] for r in ranked] == ["b", "a", "c"]
 
 
+# ---------------------------------------------------------------------------
+# pool sampling: the same keyword must not return the same videos
+# ---------------------------------------------------------------------------
+
+def _video_n(i):
+    return {"id": f"v{i}", "music": {"id": f"m{i}", "title": f"T{i}",
+                                     "author_name": "A", "duration_seconds": 15,
+                                     "play_link": f"https://cdn/{i}.mp3"}}
+
+
+def _patch_sources(monkeypatch, n_hashtag=30, n_trending=20, tags=3):
+    def fake_hashtag_videos(tag, deadline, country=None):
+        return [_video_n(f"{tag}-{i}") for i in range(n_hashtag)]
+
+    def fake_trending(deadline, country=None):
+        return [_video_n(f"trend-{i}") for i in range(n_trending)]
+
+    monkeypatch.setattr(scraper, "hashtag_videos", fake_hashtag_videos)
+    monkeypatch.setattr(scraper, "trending_videos", fake_trending)
+    monkeypatch.setattr(scraper, "music_details", lambda *a, **k: None)
+
+
+def test_pool_is_sampled_not_read_whole(monkeypatch):
+    """The fix for 'the same songs every time': fetch a deep pool, read a
+    random sample of it."""
+    _patch_sources(monkeypatch)
+    monkeypatch.setattr(scraper, "POOL_SAMPLE", 35)
+    r = scraper.fetch_trending_sounds("sad", limit=20)
+    m = r["meta"]
+    assert m["videos_fetched"] == 3 * 30 + 20, "the whole pool must be fetched"
+    assert m["videos_sampled"] == 35, "only the sample is read for sounds"
+    assert m["pool_sample"] == 35
+
+
+def test_pool_sampling_can_be_disabled(monkeypatch):
+    _patch_sources(monkeypatch)
+    monkeypatch.setattr(scraper, "POOL_SAMPLE", 0)
+    m = scraper.fetch_trending_sounds("sad", limit=20)["meta"]
+    assert m["videos_sampled"] == m["videos_fetched"] == 110
+    assert m["pool_sample"] is None
+
+
+def test_repeated_scrapes_return_a_different_mix(monkeypatch):
+    """The user-visible outcome: two scrapes of the same keyword differ."""
+    _patch_sources(monkeypatch)
+    monkeypatch.setattr(scraper, "POOL_SAMPLE", 35)
+    mixes = []
+    for _ in range(3):
+        mixes.append({s["id"] for s in scraper.fetch_trending_sounds("sad", limit=20)["sounds"]})
+    assert len({frozenset(m) for m in mixes}) >= 2, \
+        f"every scrape returned the same sounds: {mixes[0]}"
+    # and each sample really is a subset of the pool
+    assert all(m for m in mixes)
+
+
+def test_sampling_preserves_source_attribution(monkeypatch):
+    """A sampled video must keep its label, or is_niche would be wrong."""
+    _patch_sources(monkeypatch)
+    monkeypatch.setattr(scraper, "POOL_SAMPLE", 40)
+    sounds = scraper.fetch_trending_sounds("sad", limit=40)["sounds"]
+    for s in sounds:
+        assert s["sources"], s["id"]
+        assert s["is_niche"] == any(x.startswith("hashtag:") for x in s["sources"]), s
+
+
+def test_per_hashtag_count_is_capped_at_the_verified_ceiling():
+    """count=50 is rejected by TikTok (TikTokBadRequest); never allow it."""
+    assert scraper.VIDEOS_PER_HASHTAG <= scraper.MAX_VIDEOS_PER_HASHTAG == 30
+
+
 def test_unknown_usage_counts_sort_last_even_with_big_engagement():
     known = scraper._record(_music(id="known", video_count=10), [_video(1)], {"x"}, True)
     unknown = scraper._record(_music(id="unknown"), [_video(50_000_000)], {"x"}, True)

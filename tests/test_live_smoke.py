@@ -128,9 +128,31 @@ def test_live_ids_differ_from_a_different_niche():
         f"nearly identical results -- hashtag mining is not differentiating: {overlap}")
 
 
+@pytest.mark.live
+def test_live_fresh_scrapes_return_different_ids():
+    """The reported problem: the same keyword returned an identical list for
+    600s. Two forced scrapes must return a different mix, because each reads a
+    random sample of the deeper pool."""
+    first = _run("anxiety", limit=20, fresh=True)
+    second = _run("anxiety", limit=20, fresh=True)
+    ids1 = {s["id"] for s in first["sounds"]}
+    ids2 = {s["id"] for s in second["sounds"]}
+    m1, m2 = first["meta"], second["meta"]
+    print(f"\nfresh scrape 1: pool={m1.get('videos_fetched')} sampled={m1.get('videos_sampled')} "
+          f"ids={len(ids1)}")
+    print(f"fresh scrape 2: pool={m2.get('videos_fetched')} sampled={m2.get('videos_sampled')} "
+          f"ids={len(ids2)}")
+    print(f"overlap={len(ids1 & ids2)} of {min(len(ids1), len(ids2))}")
+    assert m1.get("fresh") is True and m2.get("fresh") is True
+    assert m1.get("pool_sample"), "sampling must be on"
+    assert len(ids1) > 3 and len(ids2) > 3
+    assert ids1 != ids2, "two fresh scrapes returned an identical list"
+
+
 if __name__ == "__main__":
     test_live_sad_hashtag_mining()
     test_live_explicit_hashtags()
     test_live_unmapped_keyword_derives_and_still_returns()
     test_live_ids_differ_from_a_different_niche()
+    test_live_fresh_scrapes_return_different_ids()
     print("\nall live smoke checks passed")

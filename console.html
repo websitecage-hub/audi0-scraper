@@ -29,6 +29,9 @@
   button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line);
                  font-weight:400; }
   .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
+  .chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--fg);
+         text-transform:none; letter-spacing:0; margin:0; }
+  .chk input { width:auto; }
   .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); }
   .dot.ok { background:var(--ok); } .dot.bad { background:var(--accent2); }
   .dot.busy { background:var(--warn); animation:p 1s infinite; }
@@ -74,6 +77,7 @@
       <div><label for="kw">Keyword / niche</label><input id="kw" value="sad" placeholder="sad, gym, relationship&hellip;"></div>
       <div><label for="tag">Hashtags (optional)</label><input id="tag" list="taglist" placeholder="sad,sadmusic,emotional"><datalist id="taglist"></datalist></div>
       <div><label for="limit">Limit</label><input id="limit" type="number" min="1" max="50" value="20"></div>
+      <div><label for="fresh">Cache</label><label class="chk"><input type="checkbox" id="fresh"> force fresh</label></div>
       <div><button id="go">Fetch trending sounds</button></div>
       <div><button id="clr" class="ghost">Clear</button></div>
     </div>
@@ -110,7 +114,10 @@
       so generic viral audio cannot crowd out a niche; each row is tagged niche/trending and
       carries <code>is_niche</code> for re-ranking. Sounds whose enrichment failed show
       <code>n/a</code> and sort last within their tier. A literal keyword <i>search</i> is not
-      used &mdash; that endpoint demands a login TikTok will not grant a datacenter IP.</div>
+      used &mdash; that endpoint demands a login TikTok will not grant a datacenter IP.
+      Each scrape reads a <b>random sample</b> of a deeper video pool (30 per hashtag), so
+      the same keyword gives a different mix each time; tick <b>force fresh</b> to bypass the
+      10-minute cache and scrape immediately.</div>
   </div>
 </div>
 
@@ -157,6 +164,7 @@ async function run() {
   const tag = $('tag').value.trim();
   let url = `/v1/trending?keyword=${encodeURIComponent(kw)}&limit=${lim}`;
   if (tag) url += `&hashtag=${encodeURIComponent(tag)}`;
+  if ($('fresh').checked) url += '&fresh=true';
 
   const t0 = Date.now();
   for (let attempt = 1; attempt <= 30; attempt++) {
@@ -190,6 +198,7 @@ function render(b) {
   $('kpigrid').innerHTML = [
     ['sounds returned', d.length],
     ['videos sampled', m.videos_sampled ?? '-'],
+    ['pool fetched / sampled', `${m.videos_fetched ?? '-'} / ${m.videos_sampled ?? '-'}${m.pool_sample ? ` (random ${m.pool_sample})` : ''}`],
     ['unique sounds', m.sounds_considered ?? '-'],
     ['hashtags mined', (m.hashtags_sampled || []).join(', ') || '-'],
     ['sounds enriched', `${m.sounds_enriched ?? '-'} / ${m.sounds_considered ?? '-'}`],

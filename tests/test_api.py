@@ -34,23 +34,37 @@ def _sound(i, video_count=_UNSET):
         "sample_plays": 1000 * (5 - i),
         "sample_likes": 10 * (5 - i),
         "sources": ["hashtag:sad", "trending:US"],
+        "is_niche": True,
     }
 
 
 class FakeScraper:
-    """Stands in for scraper.fetch_trending_sounds."""
+    """Stands in for scraper.fetch_trending_sounds.
+
+    Every call returns sounds with DIFFERENT ids, the way a real second scrape
+    returns a different random sample of the pool. That is what makes the
+    fresh/cache tests meaningful.
+    """
 
     def __init__(self, n=5, exc=None):
         self.n = n
         self.exc = exc
         self.calls = []
 
-    def __call__(self, keyword, limit=20, country=None, hashtag=None, deadline=None):
-        self.calls.append({"keyword": keyword, "limit": limit,
-                           "country": country, "hashtag": hashtag})
+    def __call__(self, keyword, limit=20, country=None, hashtag=None, deadline=None,
+                 fresh=False):
+        self.calls.append({"keyword": keyword, "limit": limit, "country": country,
+                           "hashtag": hashtag, "fresh": fresh})
         if self.exc:
             raise self.exc
-        sounds = [_sound(i) for i in range(self.n)][:limit]
+        gen = len(self.calls)
+        sounds = []
+        for i in range(self.n):
+            s = _sound(i)
+            s["id"] = f"{gen}000000000000000{i}"       # distinct per call
+            s["title"] = f"Track {i} (scrape {gen})"
+            sounds.append(s)
+        sounds = sounds[:limit]
         return {
             "sounds": sounds,
             "meta": {
@@ -61,7 +75,10 @@ class FakeScraper:
                 "sources": ["hashtag:sad", "hashtag:sadmusic", "trending:US"],
                 "sources_failed": [],
                 "fallback_used": None,
-                "videos_sampled": 60,
+                "videos_fetched": 110,
+                "videos_sampled": 35,
+                "pool_sample": 35,
+                "fresh": bool(fresh),
                 "sounds_considered": self.n,
                 "sounds_enriched": self.n,
                 "sounds_with_usage_count": self.n,
@@ -132,6 +149,61 @@ def test_ready_response_reports_niche_priority_and_split(client, monkeypatch):
     m = client.get("/v1/trending?keyword=sad").json()["meta"]
     assert m["niche_priority"] is True
     assert m["niche_sounds"] + m["trending_only_sounds"] == 4
+
+
+# ---------------------------------------------------------------------------
+# ?fresh=true -- cache bypass
+# ---------------------------------------------------------------------------
+
+def test_warm_cache_returns_the_same_list_without_fresh(client, monkeypatch):
+    fake = _mock(monkeypatch, FakeScraper(n=4))
+    client.get("/v1/trending?keyword=anxiety")
+    first = client.get("/v1/trending?keyword=anxiety").json()
+    second = client.get("/v1/trending?keyword=anxiety").json()
+    assert first["status"] == second["status"] == "ready"
+    assert [s["id"] for s in first["data"]] == [s["id"] for s in second["data"]]
+    assert len(fake.calls) == 1, "a warm cache must not re-scrape"
+
+
+def test_fresh_bypasses_a_warm_cache_and_returns_new_ids(client, monkeypatch):
+    """The reported problem: searching the same keyword twice returned an
+    identical list for 600s. ?fresh=true must return a genuinely new result."""
+    fake = _mock(monkeypatch, FakeScraper(n=4))
+    client.get("/v1/trending?keyword=anxiety")
+    first = client.get("/v1/trending?keyword=anxiety").json()
+
+    r = client.get("/v1/trending?keyword=anxiety&fresh=true")
+    assert r.status_code == 202, "fresh must not serve the cached list"
+    body = r.json()
+    assert body["status"] == "processing"
+    assert body["fresh"] is True
+    assert "cache bypassed" in body["message"]
+    assert "retry-after" in {k.lower() for k in r.headers}
+
+    second = client.get("/v1/trending?keyword=anxiety").json()
+    assert second["status"] == "ready"
+    first_ids = [s["id"] for s in first["data"]]
+    second_ids = [s["id"] for s in second["data"]]
+    assert first_ids != second_ids, f"fresh returned the same list: {first_ids}"
+    assert len(fake.calls) == 2
+    assert fake.calls[1]["fresh"] is True, "the forced scrape must bypass the enrichment cache too"
+
+
+def test_fresh_while_a_scrape_is_already_running_does_not_restart_it(client, monkeypatch):
+    """Polling must converge. TestClient runs background tasks inline, so the
+    in-flight state is set up directly to test the branch that matters: a fresh
+    request arriving during a forced scrape reports progress instead of
+    queueing a second scrape."""
+    fake = _mock(monkeypatch, FakeScraper(n=3))
+    key = main._cache_key("anxiety", None, None)
+    entry = main._new_entry()
+    entry.update({"status": "processing", "refreshing": True, "state_at": time.time()})
+    main.CACHE[key] = entry
+
+    r = client.get("/v1/trending?keyword=anxiety&fresh=true")
+    assert r.status_code == 202
+    assert r.json()["status"] == "processing"
+    assert fake.calls == [], "a forced scrape already in flight must not be restarted"
 
 
 def test_health_does_not_call_upstream(client, monkeypatch):
