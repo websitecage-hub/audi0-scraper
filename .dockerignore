@@ -1,0 +1,10 @@
+# Never ship development junk inside the image.
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+logs
+*.md
+!README.md
