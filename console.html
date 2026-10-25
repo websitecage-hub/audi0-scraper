@@ -47,6 +47,7 @@
         overflow:auto; font-size:11px; color:var(--dim); max-height:280px; margin:0; }
   .muted { color:var(--dim); font-size:11px; }
   .warn { color:var(--warn); }
+  .ok-text { color:var(--ok); }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
   .kpi { background:#0b0e13; border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
   .kpi b { display:block; font-size:17px; color:var(--fg); font-weight:600; }
@@ -57,7 +58,7 @@
 <body>
 <div class="wrap">
   <h1>TikTok <span>Trending Audio</span> API</h1>
-  <div class="sub">Unsigned Explore-feed sampler &middot; no API key &middot; no proxy &middot; no browser</div>
+  <div class="sub">Hashtag mining &middot; real global usage counts &middot; no API key &middot; no proxy &middot; no browser</div>
 
   <div class="card">
     <div class="row" style="justify-content:space-between">
@@ -87,7 +88,7 @@
     <table>
       <thead><tr>
         <th>#</th><th>Title / artist</th><th class="num">Dur</th><th class="num">Global uses</th>
-        <th class="num">Seen in sample</th><th class="num">Plays</th><th>Audio</th>
+        <th class="num">Seen in sample</th><th class="num">Plays</th><th>Niche</th><th>Audio</th>
       </tr></thead>
       <tbody id="tbody"></tbody>
     </table>
@@ -103,10 +104,13 @@
     <div class="muted">Sounds come from <b>hashtag mining</b>: the keyword maps to real hashtags
       (<code>/v1/trending/hashtags</code>), each hashtag's top videos are pulled, and TikTok's
       trending feed is merged in. Each unique sound is then enriched via
-      <code>/api/music/details</code> for its <b>real global usage count</b> and audio URL, and
-      results are ranked by that count. Sounds whose enrichment failed show <code>n/a</code> and
-      sort last. A literal keyword <i>search</i> is not used &mdash; that endpoint demands a
-      login TikTok will not grant a datacenter IP.</div>
+      <code>/api/music/details</code> for its <b>real global usage count</b> and audio URL.
+      With <b>niche priority</b> on (<code>NICHE_PRIORITY=1</code>, the default), sounds from the
+      keyword's own hashtags rank ahead of trending-feed-only ones regardless of usage count,
+      so generic viral audio cannot crowd out a niche; each row is tagged niche/trending and
+      carries <code>is_niche</code> for re-ranking. Sounds whose enrichment failed show
+      <code>n/a</code> and sort last within their tier. A literal keyword <i>search</i> is not
+      used &mdash; that endpoint demands a login TikTok will not grant a datacenter IP.</div>
   </div>
 </div>
 
@@ -201,6 +205,7 @@ function render(b) {
       <td class="num">${s.video_count == null ? '<span class="warn">n/a</span>' : fmt(s.video_count)}</td>
       <td class="num">${s.sample_frequency}</td>
       <td class="num">${fmt(s.sample_plays)}</td>
+      <td class="num">${s.is_niche ? '<span class="ok-text">niche</span>' : '<span class="warn">trending</span>'}</td>
       <td><a class="audio" href="${escapeAttr(s.play_link)}" target="_blank" rel="noopener">open audio &#8599;</a>
         ${s.tiktok_url ? `<br><a class="muted" href="${escapeAttr(s.tiktok_url)}" target="_blank" rel="noopener">tiktok page</a>` : ''}</td>
     </tr>`).join('');

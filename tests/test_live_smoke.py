@@ -57,16 +57,37 @@ def test_live_sad_hashtag_mining():
         assert s["id"]
         assert s["duration_seconds"] is not None
 
-    # ranking: known counts first, descending; unknown last
-    counts = [s["video_count"] for s in sounds]
-    known = [c for c in counts if c is not None]
-    assert known, "no sound came back with a real usage count"
-    assert known == sorted(known, reverse=True), known
-    first_unknown = next((i for i, c in enumerate(counts) if c is None), len(counts))
-    assert all(c is None for c in counts[first_unknown:]), "unknown counts must sort last"
+    # ranking: within each tier (niche first when NICHE_PRIORITY is on), known
+    # counts descend; unknowns sort last within their tier
+    tiers: list[list] = []
+    cur: list = []
+    cur_tier = None
+    for s in sounds:
+        tier = 0 if s.get("is_niche", True) else 1
+        if cur and tier != cur_tier:
+            tiers.append(cur)
+            cur = []
+        cur_tier = tier
+        cur.append(s["video_count"])
+    if cur:
+        tiers.append(cur)
 
-    print(f"\nOK: {len(sounds)} sounds, {len(known)} with real counts, "
-          f"top={known[0]}, in {meta['elapsed_seconds']}s")
+    known_any = False
+    total_known = 0
+    top_known = None
+    for tier in tiers:
+        known = [c for c in tier if c is not None]
+        if known:
+            known_any = True
+            total_known += len(known)
+            top_known = known[0]
+            assert known == sorted(known, reverse=True), known
+        first_unknown = next((i for i, c in enumerate(tier) if c is None), len(tier))
+        assert all(c is None for c in tier[first_unknown:]), "unknown counts must sort last in their tier"
+    assert known_any, "no sound came back with a real usage count"
+
+    print(f"\nOK: {len(sounds)} sounds, {total_known} with real counts, "
+          f"top={top_known}, in {meta['elapsed_seconds']}s")
 
 
 @pytest.mark.live

@@ -118,8 +118,9 @@ curl -s "http://localhost:8000/v1/trending?keyword=sad&limit=5" | python -m json
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/trending` | Trending sounds. `keyword` (required), `limit` (1–50, default 20), `country`, `hashtag`, `refresh` |
+| `GET /v1/trending` | Trending sounds. `keyword` (required unless `hashtag`), `limit` (1–50, default 20), `country`, `hashtag`, `refresh` |
 | `GET /v1/health` | `{"status":"ok", ...}` — GET **and** HEAD, with and without a trailing slash |
+| `GET /health` | Same handler under the plain path — for monitors pointed at `/health` (e.g. UptimeRobot) |
 | `GET /v1/trending/hashtags` | The curated keyword → hashtag map |
 | `GET /v1/trending/countries` | Regions accepted by `?country=` |
 | `GET /` | Console page |
@@ -220,6 +221,7 @@ schedule if you want it kept warm.
 | `TIKTOK_MAX_RETRIES` / `TIKTOK_BACKOFF_BASE` | `2` / `5` | Retry + exponential backoff on a block |
 | `SCRAPE_DEADLINE_SECONDS` | `25` | Hard ceiling on one scrape |
 | `ERROR_RETRY_COOLDOWN_SECONDS` | `60` | How long an errored keyword is served before retrying |
+| `NICHE_PRIORITY` | `1` | Niche-mined sounds outrank trending-feed-only ones, regardless of usage count. `0` = rank purely by count |
 | `LOG_LEVEL` | `INFO` | |
 
 ---

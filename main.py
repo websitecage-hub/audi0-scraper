@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import scraper
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -375,6 +375,7 @@ def _health_body(probe: bool = False) -> dict:
         "max_concurrent_scrapes": MAX_CONCURRENT_SCRAPES,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "usage_counts_available": scraper.usage_counts_available(),
+        "niche_priority": scraper.NICHE_PRIORITY,
         "source": "tiktok_hashtag_mining",
         "timestamp": time.time(),
     }
@@ -391,13 +392,18 @@ def _health_body(probe: bool = False) -> dict:
 @app.head("/v1/health")
 @app.get("/v1/health/", include_in_schema=False)
 @app.head("/v1/health/", include_in_schema=False)
+@app.get("/health", include_in_schema=False)          # UptimeRobot monitor
+@app.head("/health", include_in_schema=False)
+@app.get("/health/", include_in_schema=False)
+@app.head("/health/", include_in_schema=False)
 def health(request: Request, probe: bool = Query(False, description="Also make one live upstream call.")):
-    """Render's health check.
+    """Health check for Render AND the UptimeRobot monitor, which is configured
+    against `/health` on the older deployment this replaces.
 
-    Registered for GET *and* HEAD, with and without a trailing slash: a
-    HEAD-configured monitor gets a 501 from a GET-only route, and an exact-path
-    match 404s on `/v1/health/` -- both read as "service down" while the service
-    is perfectly healthy.
+    Registered for GET *and* HEAD, with and without a trailing slash, under
+    both `/v1/health` and `/health`: a HEAD-configured monitor gets a 501 from
+    a GET-only route, and an exact-path match 404s on the slash variant --
+    both read as "service down" while the service is perfectly healthy.
     """
     body = _health_body(probe)
     if request.method == "HEAD":

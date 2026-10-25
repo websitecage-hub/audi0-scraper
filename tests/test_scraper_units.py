@@ -116,12 +116,59 @@ def test_record_tolerates_missing_duration():
 # ranking: real usage count first
 # ---------------------------------------------------------------------------
 
+def _niche(**over):
+    return scraper._record(_music(**over), [_video()], {"hashtag:sad"}, True)
+
+
+def _generic(**over):
+    return scraper._record(_music(**over), [_video()], {"trending:US"}, True)
+
 def test_ranking_puts_known_usage_counts_first_descending():
     big = scraper._record(_music(id="big", title="B", video_count=90000), [_video()], {"x"}, True)
     mid = scraper._record(_music(id="mid", title="M", video_count=500), [_video()], {"x"}, True)
-    unknown = scraper._record(_music(id="unk", title="U"), [_video()], {"x"}, True)
+    unknown = scraper._record(_music(id="unk", title="U", video_count=None), [_video()], {"x"}, True)
     ranked = sorted([mid, unknown, big], key=scraper._order_key)
     assert [r["id"] for r in ranked] == ["big", "mid", "unk"]
+
+
+# ---------------------------------------------------------------------------
+# is_niche + NICHE_PRIORITY ranking
+# ---------------------------------------------------------------------------
+
+def test_record_marks_niche_sounds():
+    niche = _niche(id="n")
+    generic = _generic(id="g")
+    both = scraper._record(_music(id="b"), [_video()],
+                           {"hashtag:sad", "trending:US"}, True)
+    assert niche["is_niche"] is True
+    assert generic["is_niche"] is False
+    assert both["is_niche"] is True, "a hashtag source makes it niche even if trending also carried it"
+
+
+def test_niche_priority_puts_a_small_niche_sound_above_a_big_generic_one():
+    """The reason this knob exists: a niche sound with 5,000 uses must outrank a
+    generic trending sound with 200,000 uses."""
+    big_generic = _generic(id="big", video_count=200_000)
+    small_niche = _niche(id="small", video_count=5_000)
+    ranked = sorted([big_generic, small_niche], key=scraper._order_key)
+    assert [r["id"] for r in ranked] == ["small", "big"]
+
+
+def test_niche_priority_off_ranks_purely_by_usage_count(monkeypatch):
+    monkeypatch.setattr(scraper, "NICHE_PRIORITY", False)
+    big_generic = _generic(id="big", video_count=200_000)
+    small_niche = _niche(id="small", video_count=5_000)
+    ranked = sorted([big_generic, small_niche], key=scraper._order_key)
+    assert [r["id"] for r in ranked] == ["big", "small"]
+
+
+def test_all_niche_results_keep_pure_count_ordering():
+    """Within the niche tier the order is still the real usage count."""
+    a = _niche(id="a", video_count=10)
+    b = _niche(id="b", video_count=1000)
+    c = _niche(id="c", video_count=None)
+    ranked = sorted([c, a, b], key=scraper._order_key)
+    assert [r["id"] for r in ranked] == ["b", "a", "c"]
 
 
 def test_unknown_usage_counts_sort_last_even_with_big_engagement():

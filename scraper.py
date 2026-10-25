@@ -87,6 +87,13 @@ SCRAPE_DEADLINE_SECONDS = float(os.environ.get("SCRAPE_DEADLINE_SECONDS", "25"))
 MAX_RETRIES = int(os.environ.get("TIKTOK_MAX_RETRIES", "2"))
 BACKOFF_BASE_SECONDS = float(os.environ.get("TIKTOK_BACKOFF_BASE", "5"))
 
+# When True (the default), a sound mined from the keyword's own hashtags
+# outranks a trending-feed-only sound regardless of usage count, so generic
+# viral audio cannot crowd a niche out of its own results. Each track carries
+# `is_niche` either way, so a client can re-rank. Accepts 0/false/no/off.
+NICHE_PRIORITY = os.environ.get("NICHE_PRIORITY", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+
 # In-process caches. Hashtag ids are stable for hours; a sound's usage count
 # changes slowly, so a 10-minute TTL costs nothing and removes most of the
 # upstream load when several keywords share popular sounds.
@@ -448,6 +455,7 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
         # a genuinely huge sound to the bottom.
         usage_basis = "unavailable_enrichment_failed" if enriched else "not_enriched"
 
+    source_list = sorted(sources)
     return {
         "id": str(music.get("id")),
         "title": music.get("title"),
@@ -463,7 +471,11 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
         "sample_frequency": len(videos_using),
         "sample_plays": plays,
         "sample_likes": likes,
-        "sources": sorted(sources),
+        "sources": source_list,
+        # True when the sound was found via the keyword's own hashtags; False
+        # when it arrived only from the shared trending feed (or the Explore
+        # fallback). _order_key ranks on this under NICHE_PRIORITY.
+        "is_niche": any(s.startswith("hashtag:") for s in source_list),
 
         "cover": _absolute_url(music.get("cover")),
         "tiktok_url": music.get("link"),
@@ -475,16 +487,21 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
 
 
 def _order_key(r: dict):
-    """Rank by REAL global usage count; sounds whose enrichment failed sort
-    last, ordered by in-sample recurrence.
+    """Niche sounds first (under NICHE_PRIORITY), then by REAL global usage
+    count; sounds whose enrichment failed sort last within their tier, ordered
+    by in-sample recurrence.
 
-    Ordering is a deliberate, documented part of the contract now that
-    video_count is trustworthy -- there is no synthetic blended score to
-    mislead a client about why a track is where it is.
+    With NICHE_PRIORITY on, a niche sound with 5,000 uses outranks a generic
+    trending sound with 200,000 uses: the trending feed is shared by every
+    keyword, so ranking on count alone lets it dominate every niche. Turn the
+    knob off to rank purely by usage count. `is_niche` is on every record
+    either way, so clients can re-rank.
     """
     vc = r["video_count"]
+    niche_tier = 0 if (not NICHE_PRIORITY or r.get("is_niche")) else 1
     return (
-        0 if vc is not None else 1,          # known counts first
+        niche_tier,                           # niche sounds first when priority is on
+        0 if vc is not None else 1,          # known counts before unknown, within tier
         -(vc or 0),                           # then by global usage, desc
         -r["sample_frequency"],               # then in-sample recurrence
         -r["sample_plays"],

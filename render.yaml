@@ -64,6 +64,11 @@ services:
       # Bound on cached keywords, so memory cannot grow without limit.
       - key: CACHE_MAX_ENTRIES
         value: "256"
+      # Niche sounds first: a sound mined from the keyword's own hashtags
+      # outranks a trending-feed-only sound regardless of usage count. Set to
+      # "0" to rank purely by real usage count.
+      - key: NICHE_PRIORITY
+        value: "1"
       # NOTE: TIKTOK_PROXY is NOT needed. The signed endpoints this build
       # relies on (/api/challenge/detail/, /api/challenge/item_list/,
       # /api/music/detail/, /api/recommend/item_list/) answer normally from a

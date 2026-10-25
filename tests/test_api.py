@@ -110,6 +110,20 @@ def test_health_head_and_trailing_slash(client):
     assert client.head("/v1/health/").status_code == 200
 
 
+def test_health_alias_for_uptimerobot(client):
+    """/health and /health/ must work for GET and HEAD: the monitor watching the
+    older deployment points at /health and must not see a 404 or a 501."""
+    assert client.get("/health").status_code == 200
+    assert client.get("/health").json()["status"] == "ok"
+    assert client.head("/health").status_code == 200
+    assert client.get("/health/").status_code == 200
+    assert client.head("/health/").status_code == 200
+
+
+def test_health_reports_niche_priority(client):
+    assert client.get("/health").json()["niche_priority"] is True
+
+
 def test_health_does_not_call_upstream(client, monkeypatch):
     """The default health path must make no upstream call -- monitors hit it
     around the clock."""
