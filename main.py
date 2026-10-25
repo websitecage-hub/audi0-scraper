@@ -337,6 +337,10 @@ def trending(
             "sounds_returned": len(capped),
             "requested_limit": limit,
             "with_usage_count": sum(1 for s in capped if s.get("video_count") is not None),
+            # Auditable from the query response itself, not just /v1/health.
+            "niche_priority": scraper.NICHE_PRIORITY,
+            "niche_sounds": sum(1 for s in capped if s.get("is_niche")),
+            "trending_only_sounds": sum(1 for s in capped if not s.get("is_niche")),
             "refresh_error": snapshot.get("refresh_error"),
         })
         return {

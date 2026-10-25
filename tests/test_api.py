@@ -124,6 +124,16 @@ def test_health_reports_niche_priority(client):
     assert client.get("/health").json()["niche_priority"] is True
 
 
+def test_ready_response_reports_niche_priority_and_split(client, monkeypatch):
+    """The ranking mode and the niche/trending split must be visible in the
+    query response, not only in /v1/health."""
+    _mock(monkeypatch, FakeScraper(n=4))
+    client.get("/v1/trending?keyword=sad")
+    m = client.get("/v1/trending?keyword=sad").json()["meta"]
+    assert m["niche_priority"] is True
+    assert m["niche_sounds"] + m["trending_only_sounds"] == 4
+
+
 def test_health_does_not_call_upstream(client, monkeypatch):
     """The default health path must make no upstream call -- monitors hit it
     around the clock."""

@@ -193,6 +193,7 @@ function render(b) {
     ['unique sounds', m.sounds_considered ?? '-'],
     ['hashtags mined', (m.hashtags_sampled || []).join(', ') || '-'],
     ['sounds enriched', `${m.sounds_enriched ?? '-'} / ${m.sounds_considered ?? '-'}`],
+    ['niche / trending', `${m.niche_sounds ?? '-'} / ${m.trending_only_sounds ?? '-'}`],
     ['scrape seconds', m.elapsed_seconds ?? '-'],
   ].map(([k, v]) => `<div class="kpi"><b>${escapeHtml(String(v))}</b><i>${k}</i></div>`).join('');
 
