@@ -155,6 +155,12 @@ KEYWORD_HASHTAGS: dict[str, list[str]] = {
     "fashion": ["fashion", "fashiontok", "outfit"],
     "outfit": ["outfit", "outfitinspo", "fashion"],
     "art": ["art", "arttok", "artistsoftiktok"],
+    # NOTE: #booktok itself is NOT listable -- /api/challenge/item_list/ answers
+    # `upstream status 1` for it every time (verified 3/3, and standalone), even
+    # though the tag obviously exists. Route around it rather than fail on it.
+    "books": ["booktiktok", "bookrecommendations", "bookclub"],
+    "booktok": ["booktiktok", "bookrecommendations", "bookclub"],
+    "reading": ["reading", "bookworm", "bookish"],
     "anime": ["anime", "animetiktok", "manga"],
     "study": ["studytok", "studymotivation", "study"],
     "school": ["school", "studytok", "college"],
