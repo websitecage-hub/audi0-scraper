@@ -94,7 +94,16 @@ class FakeScraper:
 
 
 @pytest.fixture(autouse=True)
-def clean_cache():
+def clean_cache(monkeypatch):
+    """Most tests here exercise the CACHE path (i.e. `fresh=false` semantics).
+
+    The production default is FRESH_BY_DEFAULT=1, so a request without `fresh`
+    forces a new scrape; those tests would all see a 202 instead of a cached
+    read. Turning the default off for the shared fixture keeps each cache test
+    testing the cache, and the fresh-by-default behaviour has its own tests
+    (see test_fresh_is_the_default_so_every_search_is_new).
+    """
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", False)
     main.CACHE.clear()
     yield
     main.CACHE.clear()
@@ -204,6 +213,57 @@ def test_fresh_while_a_scrape_is_already_running_does_not_restart_it(client, mon
     assert r.status_code == 202
     assert r.json()["status"] == "processing"
     assert fake.calls == [], "a forced scrape already in flight must not be restarted"
+
+
+def test_fresh_is_the_default_so_every_search_is_new(client, monkeypatch):
+    """The requested behaviour: a plain search must not replay the same list.
+    Omitting `fresh` forces a new scrape; `fresh=false` reads the result."""
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
+    fake = _mock(monkeypatch, FakeScraper(n=4))
+
+    assert client.get("/v1/trending?keyword=anxiety").status_code == 202   # cold
+    first = client.get("/v1/trending?keyword=anxiety&fresh=false").json()
+    assert first["status"] == "ready"
+
+    r = client.get("/v1/trending?keyword=anxiety")          # no fresh -> forces again
+    assert r.status_code == 202
+    body = r.json()
+    assert body["fresh"] is True
+    assert "cache bypassed" in body["message"]
+    # the 202 must tell the caller how to poll, or it cannot converge
+    assert body["poll_with"].endswith("fresh=false")
+    assert "keyword=anxiety" in body["poll_with"]
+
+    second = client.get("/v1/trending?keyword=anxiety&fresh=false").json()
+    assert second["status"] == "ready"
+    assert [s["id"] for s in first["data"]] != [s["id"] for s in second["data"]], \
+        "a default search returned the cached list"
+    assert len(fake.calls) == 2
+
+
+def test_polling_with_fresh_false_converges_under_the_fresh_default(client, monkeypatch):
+    """Polling must never re-force the scrape it is waiting on."""
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
+    fake = _mock(monkeypatch, FakeScraper(n=3))
+    assert client.get("/v1/trending?keyword=calm").status_code == 202
+    for _ in range(3):
+        assert client.get("/v1/trending?keyword=calm&fresh=false").json()["status"] == "ready"
+    assert len(fake.calls) == 1, "a poll must not start another scrape"
+
+
+def test_explicit_fresh_false_never_scrapes_a_warm_entry(client, monkeypatch):
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
+    fake = _mock(monkeypatch, FakeScraper(n=3))
+    client.get("/v1/trending?keyword=calm")                       # cold scrape
+    for _ in range(3):
+        b = client.get("/v1/trending?keyword=calm&fresh=false").json()
+        assert b["status"] == "ready"
+    assert len(fake.calls) == 1
+
+
+def test_health_reports_the_fresh_default(client, monkeypatch):
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
+    assert client.get("/health").json()["fresh_by_default"] is True
 
 
 def test_health_does_not_call_upstream(client, monkeypatch):

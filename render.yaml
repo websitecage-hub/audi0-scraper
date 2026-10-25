@@ -75,6 +75,15 @@ services:
       # "0" to rank purely by real usage count.
       - key: NICHE_PRIORITY
         value: "1"
+      # Fresh results by default: a search that does not pass `fresh` forces a
+      # new scrape, so the same keyword returns a new mix instead of the cached
+      # list. Polls pass fresh=false. Set to "0" to make the cache authoritative.
+      - key: FRESH_BY_DEFAULT
+        value: "1"
+      # Expand an unmapped keyword with TikTok's own query suggestions, so every
+      # keyword mines several hashtags instead of one. "0" disables it.
+      - key: TIKTOK_SUGGEST_TAGS
+        value: "1"
       # NOTE: TIKTOK_PROXY is NOT needed. The signed endpoints this build
       # relies on (/api/challenge/detail/, /api/challenge/item_list/,
       # /api/music/detail/, /api/recommend/item_list/) answer normally from a

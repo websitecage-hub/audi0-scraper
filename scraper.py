@@ -68,6 +68,7 @@ HASHTAG_VIDEOS_PATH = "/api/challenge/item_list/"
 MUSIC_DETAIL_PATH = "/api/music/detail/"
 TRENDING_PATH = "/api/recommend/item_list/"
 EXPLORE_PATH = "/api/explore/item_list/"          # last-resort fallback only
+SUGGEST_PATH = "/api/search/general/preview/"     # query suggestions, UNSIGNED
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -87,6 +88,15 @@ TRENDING_COUNT = int(os.environ.get("TIKTOK_TRENDING_COUNT", "20"))
 # an identical list; with it, a repeat search (or ?fresh=true) yields a
 # different mix of the same niche. 0 disables sampling (use the whole pool).
 POOL_SAMPLE = int(os.environ.get("TIKTOK_POOL_SAMPLE", "35"))
+
+# Expand an UNMAPPED keyword using TikTok's own query suggestions. This is what
+# gives every keyword a deep pool, not just the hand-mapped ones: an unmapped
+# single word otherwise derives to ONE hashtag (~50-video ceiling) while a
+# mapped keyword gets three (~110). Suggestions are relevance-ranked by TikTok
+# and cost one unsigned call, so this is the general fix rather than a bigger
+# hand-written table.
+SUGGEST_TAGS = os.environ.get("TIKTOK_SUGGEST_TAGS", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
 HASHTAG_FANOUT = int(os.environ.get("TIKTOK_HASHTAG_FANOUT", "3"))
 MAX_WORKERS = int(os.environ.get("TIKTOK_MAX_WORKERS", "4"))
 ENRICH_WORKERS = int(os.environ.get("TIKTOK_ENRICH_WORKERS", "6"))
@@ -267,6 +277,93 @@ def resolve_hashtags(keyword: str, explicit: str | None = None,
             if w and w not in candidates:
                 candidates.append(w)
     return (candidates or ["fyp"])[:max(1, fanout)], "derived"
+
+
+def _tagify(text: str) -> str:
+    """TikTok query text -> a hashtag name. 'Anxiety Attacks' -> 'anxietyattacks'."""
+    return "".join(c for c in (text or "").lower() if c.isalnum())
+
+
+def suggested_terms(keyword: str, country=None, limit: int = 12) -> list[str]:
+    """TikTok's own relevance-ranked query suggestions for a keyword.
+
+    UNSIGNED and login-free, which matters because it is the one discovery
+    surface that still works when the signer rots. Verified: the payload nests
+    the terms under `sug_list`, and 'anxiety' answers
+    ['Anxiety Attacks', 'Anxiety Songs', ...].
+
+    Never raises: suggestions are an enhancement, not a dependency.
+    """
+    try:
+        payload = api(SUGGEST_PATH, {"keyword": keyword, "count": limit},
+                      signed=False, boot=False,
+                      country=(country.lower() if country else None),
+                      label="suggestions")
+    except Exception as exc:                  # noqa: BLE001
+        log.info("suggestions unavailable for %r: %s", keyword, exc)
+        return []
+    return P.suggestions(payload.get("sug_list")) or []
+
+
+def expand_hashtags(keyword: str, explicit: str | None = None, deadline: float | None = None,
+                    country: str | None = None,
+                    fanout: int = HASHTAG_FANOUT) -> tuple[list[str], str]:
+    """resolve_hashtags() plus suggestion expansion for UNMAPPED keywords.
+
+    `how` is one of: explicit | mapped | derived+suggested | derived | empty-keyword.
+
+    Why this exists: a keyword absent from the curated table derives to a single
+    tag, which caps its pool at ~50 videos, while a mapped keyword gets three
+    (~110). Rather than keep hand-adding entries, ask TikTok what people search
+    alongside the keyword, tagify those phrases, and keep the ones that are
+    real hashtags. Existence is checked via hashtag_id (cached 1h, ~0.19s) --
+    cheaper than mining a tag that is not there, and any tag that still yields
+    no videos is reported in sources_failed rather than being fatal.
+    """
+    tags, how = resolve_hashtags(keyword, explicit=explicit, fanout=fanout)
+    if how in ("explicit", "mapped") or len(tags) >= fanout or not SUGGEST_TAGS:
+        return tags, how
+
+    deadline = deadline or (time.monotonic() + SCRAPE_DEADLINE_SECONDS)
+    seen = set(tags)
+    added: list[str] = []
+    for term in suggested_terms(keyword, country):
+        tag = _tagify(term)
+        if not tag or tag in seen or not (3 <= len(tag) <= 40) or tag in _STOPWORDS:
+            continue
+        try:
+            hashtag_id(tag, deadline, country)   # raises if the tag does not exist
+        except Exception:                        # noqa: BLE001
+            continue
+        seen.add(tag)
+        added.append(tag)
+        if len(tags) + len(added) >= fanout:
+            break
+
+    if added:
+        return tags + added, "derived+suggested"
+    return tags, how
+
+
+def _sample_pool(sources: list[tuple[str, list[dict]]], n: int) -> list[tuple[str, dict]]:
+    """Read a random sample of the pool, STRATIFIED by source.
+
+    Uniform sampling over the flat pool can miss a whole hashtag by chance, so
+    one facet of a niche never appears. Giving each source roughly its share
+    (floor of one video) keeps every working hashtag represented while still
+    returning a different mix on every scrape.
+    """
+    flat = [(label, video) for label, videos in sources for video in videos]
+    if not n or len(flat) <= n:
+        return flat
+    total = len(flat)
+    out: list[tuple[str, dict]] = []
+    for label, videos in sources:
+        share = max(1, round(n * len(videos) / total))
+        out.extend((label, v) for v in random.sample(videos, min(share, len(videos))))
+    if len(out) > n:
+        out = random.sample(out, n)
+    return out
 
 
 def hashtag_catalog() -> dict[str, list[str]]:
@@ -554,7 +651,8 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
     deadline = deadline or (time.monotonic() + SCRAPE_DEADLINE_SECONDS)
     limit = max(1, min(int(limit or 20), 50))
 
-    tags, resolution = resolve_hashtags(keyword, explicit=hashtag)
+    tags, resolution = expand_hashtags(keyword, explicit=hashtag, deadline=deadline,
+                                       country=country)
 
     sources: list[tuple[str, list[dict]]] = []
     failed: list[dict] = []
@@ -600,14 +698,12 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         raise ScrapeError(f"no sounds found for {keyword!r} ({detail})")
 
     # --- 4. sample the pool at random ------------------------------------
-    # Sampling happens across the whole pool (every hashtag plus the trending
-    # feed) so repeated searches surface different sounds instead of the same
-    # top videos. Labels ride along with each video, so a sampled video keeps
-    # its real source and `is_niche` stays correct.
-    pool = [(label, video) for label, videos in sources for video in videos]
-    videos_fetched = len(pool)
-    if POOL_SAMPLE and len(pool) > POOL_SAMPLE:
-        pool = random.sample(pool, POOL_SAMPLE)
+    # Stratified by source (see _sample_pool) so no hashtag can be squeezed out
+    # of the sample by chance, and so a repeat search surfaces different sounds
+    # instead of the same top videos. Labels ride along with each video, so a
+    # sampled video keeps its real source and `is_niche` stays correct.
+    pool = _sample_pool(sources, POOL_SAMPLE)
+    videos_fetched = sum(len(videos) for _label, videos in sources)
     videos_sampled = len(pool)
 
     # --- 5. dedupe by music id -------------------------------------------
@@ -681,6 +777,7 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         "videos_fetched": videos_fetched,
         "videos_sampled": videos_sampled,
         "pool_sample": POOL_SAMPLE or None,
+        "sample_strategy": "stratified_by_source" if POOL_SAMPLE else "whole_pool",
         "fresh": bool(fresh),
         "sounds_considered": len(records),
         "sounds_enriched": len(enriched_map),

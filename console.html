@@ -77,7 +77,7 @@
       <div><label for="kw">Keyword / niche</label><input id="kw" value="sad" placeholder="sad, gym, relationship&hellip;"></div>
       <div><label for="tag">Hashtags (optional)</label><input id="tag" list="taglist" placeholder="sad,sadmusic,emotional"><datalist id="taglist"></datalist></div>
       <div><label for="limit">Limit</label><input id="limit" type="number" min="1" max="50" value="20"></div>
-      <div><label for="fresh">Cache</label><label class="chk"><input type="checkbox" id="fresh"> force fresh</label></div>
+      <div><label for="fresh">Cache</label><label class="chk"><input type="checkbox" id="fresh" checked> fresh scrape</label></div>
       <div><button id="go">Fetch trending sounds</button></div>
       <div><button id="clr" class="ghost">Clear</button></div>
     </div>
@@ -115,9 +115,11 @@
       carries <code>is_niche</code> for re-ranking. Sounds whose enrichment failed show
       <code>n/a</code> and sort last within their tier. A literal keyword <i>search</i> is not
       used &mdash; that endpoint demands a login TikTok will not grant a datacenter IP.
-      Each scrape reads a <b>random sample</b> of a deeper video pool (30 per hashtag), so
-      the same keyword gives a different mix each time; tick <b>force fresh</b> to bypass the
-      10-minute cache and scrape immediately.</div>
+      An unmapped keyword is expanded with <b>TikTok's own search suggestions</b>, so it
+      still mines several hashtags rather than one. Each scrape reads a
+      <b>random, per-hashtag-stratified sample</b> of the pool, so the same keyword gives
+      a different mix every time; <b>fresh scrape</b> is on by default, and each poll sends
+      <code>fresh=false</code> to read the result it started.</div>
   </div>
 </div>
 
@@ -168,9 +170,10 @@ async function run() {
 
   const t0 = Date.now();
   for (let attempt = 1; attempt <= 30; attempt++) {
-    // fresh only on the first request: a fresh call against an already-ready
-    // entry forces ANOTHER scrape, so polling with it would never converge.
-    const url = attempt === 1 && useFresh ? base + '&fresh=true' : base;
+    // attempt 1 honours the checkbox (fresh is the server default too); every
+    // poll passes fresh=false explicitly so it READS the result instead of
+    // forcing yet another scrape, which would never converge.
+    const url = base + (attempt === 1 ? `&fresh=${useFresh}` : '&fresh=false');
     let r, b;
     try { ({ r, b } = await api(url)); }
     catch (e) { $('status').textContent = 'network error: ' + e; break; }

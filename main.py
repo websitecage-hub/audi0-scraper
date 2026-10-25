@@ -45,7 +45,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import scraper
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -58,6 +58,15 @@ MAX_CONCURRENT_SCRAPES = int(os.environ.get("MAX_CONCURRENT_SCRAPES", "2"))
 STALE_PROCESSING_SECONDS = int(os.environ.get("STALE_PROCESSING_SECONDS", "120"))
 POLL_AFTER_SECONDS = int(os.environ.get("POLL_AFTER_SECONDS", "5"))
 MAX_LIMIT = 50
+
+# Fresh results by default. A cold request always scrapes, but a WARM one used to
+# serve the cached list for up to CACHE_TTL_SECONDS -- which reads as "the API
+# keeps showing me the same songs". With this on (default), any request that
+# does not pass `fresh` explicitly forces a new scrape, so every search returns
+# a new mix. Polls must pass `fresh=false` to read the result; the 202 body says
+# so. Set FRESH_BY_DEFAULT=0 to make the cache authoritative again.
+FRESH_BY_DEFAULT = os.environ.get("FRESH_BY_DEFAULT", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
 
 # One scrape fills the cache for any `limit`, so sample the maximum and slice
 # per request; a limit=5 request must not poison a later limit=50.
@@ -210,6 +219,7 @@ def scrape_and_cache(key: str, keyword: str, country: str | None, hashtag: str |
 
 @app.get("/v1/trending")
 def trending(
+    request: Request,
     background_tasks: BackgroundTasks,
     keyword: str | None = Query(None, max_length=120,
                                 description="Keyword or niche, e.g. 'sad'. Mapped onto real TikTok hashtags. Optional when `hashtag` is given."),
@@ -219,7 +229,7 @@ def trending(
     hashtag: str | None = Query(None,
                                 description="Explicit hashtag(s), comma-separated: 'sad,sadmusic'. Skips the keyword mapping and works on its own."),
     refresh: bool = Query(False, description="Refresh in the background while serving the cached value immediately (stale-while-revalidate)."),
-    fresh: bool = Query(False, description="Bypass the cache: force a live scrape now and return the NEW result. Answers 202 until it is ready."),
+    fresh: bool | None = Query(None, description="true = bypass the cache and scrape now (the default). false = read the cached result / poll for one."),
 ):
     keyword = (keyword or "").strip()
     hashtag = (hashtag or "").strip() or None
@@ -253,6 +263,11 @@ def trending(
                 status_code=400,
             )
 
+    # Tri-state: omitted means "use the server default" (fresh unless
+    # FRESH_BY_DEFAULT=0), so a plain search always returns a new mix while a
+    # poll can pass fresh=false to read the result that scrape produced.
+    force_fresh = FRESH_BY_DEFAULT if fresh is None else bool(fresh)
+
     key = _cache_key(keyword, country, hashtag)
     now = time.time()
     schedule = False
@@ -270,7 +285,7 @@ def trending(
 
         elif entry["status"] == "ready" and entry.get("data"):
             age = now - (entry.get("ready_at") or 0)
-            if fresh and not entry.get("refreshing"):
+            if force_fresh and not entry.get("refreshing"):
                 # ?fresh=true: bypass the cache entirely. The entry goes back to
                 # "processing" so this caller -- and anyone polling -- waits for
                 # the NEW result instead of being handed the same list again.
@@ -282,7 +297,7 @@ def trending(
                 entry["refreshing"] = True
                 schedule = True
                 decision = "fresh-forced"
-            elif fresh:
+            elif force_fresh:
                 # A forced scrape is already running: report progress instead of
                 # restarting it, so polling converges on the new result.
                 decision = "processing"
@@ -306,7 +321,7 @@ def trending(
                 decision = "processing"
 
         elif entry["status"] == "error":
-            if fresh or refresh or now - entry["state_at"] >= ERROR_RETRY_COOLDOWN_SECONDS:
+            if force_fresh or refresh or now - entry["state_at"] >= ERROR_RETRY_COOLDOWN_SECONDS:
                 entry["status"] = "processing"
                 entry["state_at"] = now
                 entry["refreshing"] = True
@@ -325,20 +340,27 @@ def trending(
         scheduled = _scheduled_locked()
 
     if schedule:
-        background_tasks.add_task(scrape_and_cache, key, keyword, country, hashtag, fresh)
+        background_tasks.add_task(scrape_and_cache, key, keyword, country, hashtag,
+                                  force_fresh)
 
     # -- shape the response --------------------------------------------------
     if decision in ("cold", "processing", "processing-stale-reschedule", "error-retry",
                     "fresh-forced"):
-        message = (f"Fresh scrape forced (cache bypassed). Poll again in {POLL_AFTER_SECONDS} seconds."
-                   if decision == "fresh-forced"
-                   else f"Scrape started. Poll again in {POLL_AFTER_SECONDS} seconds.")
+        if force_fresh and decision == "fresh-forced":
+            message = (f"Fresh scrape started (cache bypassed). Poll this URL with "
+                       f"&fresh=false in {POLL_AFTER_SECONDS} seconds for the result.")
+        elif force_fresh:
+            message = (f"Fresh scrape already running. Poll this URL with &fresh=false "
+                       f"in {POLL_AFTER_SECONDS} seconds for the result.")
+        else:
+            message = f"Scrape started. Poll again in {POLL_AFTER_SECONDS} seconds."
         return JSONResponse(
             {
                 "status": "processing",
                 "keyword": keyword,
                 "message": message,
-                "fresh": bool(fresh),
+                "fresh": force_fresh,
+                "poll_with": str(request.url.include_query_params(fresh="false")),
                 "retry_after_seconds": POLL_AFTER_SECONDS,
                 "scrapes_scheduled": scheduled,
                 "max_concurrent_scrapes": MAX_CONCURRENT_SCRAPES,
@@ -407,6 +429,7 @@ def _health_body(probe: bool = False) -> dict:
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "usage_counts_available": scraper.usage_counts_available(),
         "niche_priority": scraper.NICHE_PRIORITY,
+        "fresh_by_default": FRESH_BY_DEFAULT,
         "source": "tiktok_hashtag_mining",
         "timestamp": time.time(),
     }

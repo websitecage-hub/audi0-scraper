@@ -132,7 +132,7 @@ curl -s "http://localhost:8000/v1/trending?keyword=sad&limit=5" | python -m json
 
 | State | HTTP | Body |
 |---|---|---|
-| cold / running | `202` | `{"status":"processing","retry_after_seconds":5}` + `Retry-After` header |
+| cold / running | `202` | `{"status":"processing","fresh":true,"poll_with":"…&fresh=false",…}` + `Retry-After` |
 | ready | `200` | `{"status":"ready","data":[...]}` |
 | still fresh (cache hit) | `200` | as above, `meta.stale: false` |
 | expired but populated | `200` | serves the **stale** data immediately, `meta.stale: true`, refreshes in background |
@@ -143,48 +143,50 @@ curl -s "http://localhost:8000/v1/trending?keyword=sad&limit=5" | python -m json
 instantly and refreshed behind the request, so a slow refresh never degrades a
 warm keyword back to a 202.
 
-### Repeated searches, and asking for something new
+### Fresh results every time
 
-The cache (600 s) means a repeat of the same keyword returns the *same* list —
-that is the point of a cache, but it makes the API look stale when you are
-browsing a niche. Two mechanisms fix that:
+A cache that replays the same list makes the API look broken when you are
+browsing a niche, so **freshness is the default**. Three mechanisms:
 
-**Every scrape reads a random sample of a deeper pool.** The service fetches up
-to 30 videos per hashtag (3 tags) plus the trending feed — a pool of ~110
-videos — then reads a random sample of `TIKTOK_POOL_SAMPLE` (35) of them before
-extracting sounds. So even when the cache *does* expire, the next scrape returns
-a different mix of the same niche rather than the same top three videos.
-`meta.videos_fetched` is the pool; `meta.videos_sampled` is what was read.
-30 per hashtag is a verified ceiling — TikTok answers `count=30` with 30 videos
-but rejects `count=50`, so `TIKTOK_VIDEOS_PER_HASHTAG` is hard-capped there.
+**1. A plain search always scrapes.** `fresh` is tri-state:
 
-**`?fresh=true` bypasses the cache entirely.** It ignores whatever is cached,
-runs a live scrape, and returns the new result (via the usual 202 → poll flow,
-with `"message": "Fresh scrape forced (cache bypassed)..."`). The forced scrape
-also skips the per-sound enrichment cache, so usage counts are re-read live.
+| Request | Behaviour |
+|---|---|
+| `?keyword=x` (omitted) | **forces a new scrape** — `202`, then poll |
+| `?keyword=x&fresh=true` | same, explicitly |
+| `?keyword=x&fresh=false` | reads the cached result — use this to **poll** |
 
-Call it **once**, then poll the same URL *without* `fresh`. A `fresh` request
-against an entry that is already ready forces yet another scrape — that is what
-"bypass the cache" means — so polling with `fresh=true` would never converge:
+The 202 body therefore includes `"poll_with"`: the exact URL to poll, already
+carrying `fresh=false`. A `fresh` request against a ready entry deliberately
+starts *another* scrape — that is what bypassing the cache means — so polling
+with `fresh=true` would never converge. Set `FRESH_BY_DEFAULT=0` to make the
+cache authoritative again.
 
 ```bash
-curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"     # 202, scrape forced
-curl "localhost:8000/v1/trending?keyword=anxiety"               # poll -> ready, NEW ids
-curl "localhost:8000/v1/trending?keyword=anxiety&fresh=true"     # 202, force again
-curl "localhost:8000/v1/trending?keyword=anxiety"               # poll -> ready, different mix
+curl "localhost:8000/v1/trending?keyword=anxiety"                # 202 (+ poll_with)
+curl "localhost:8000/v1/trending?keyword=anxiety&fresh=false"    # ready, NEW mix
 ```
+
+**2. Each scrape reads a random, stratified sample of a deep pool.** Up to 30
+videos per hashtag × 3 tags + the trending feed = a pool of ~110 videos
+(`meta.videos_fetched`), of which `TIKTOK_POOL_SAMPLE` (35) are read
+(`meta.videos_sampled`). Sampling is **stratified per source**, so a flat random
+draw cannot miss a whole hashtag and leave one facet of the niche unrepresented.
+
+**3. Every keyword gets that deep pool** — see "How a scrape is assembled"
+above; unmapped keywords are expanded with TikTok's own suggestions.
+
+Measured: repeating an unmapped keyword (`thrifting`) returned **1 of 20 sounds
+in common** between consecutive scrapes, versus an identical list before.
 
 `?refresh=true` is different and still supported: it serves the cached value
 immediately and refreshes behind the request (stale-while-revalidate).
 
-Two honest trade-offs of `fresh=true`, because the cache is shared per keyword:
-
-* While a forced scrape runs (~5–10 s), that keyword answers `202` to *everyone*,
-  not just the caller who asked for fresh. The cached data is not deleted, so if
-  the forced scrape fails the old list is still served with `meta.refresh_error`.
-* Repeated `?fresh=true` calls in a tight loop therefore coalesce: they are told
-  `processing` rather than each starting their own scrape. Polling always
-  converges.
+One honest trade-off, since the cache is keyed per keyword: while a scrape is
+running (`~5–15 s`) that keyword answers `202` to *everyone*, not just the caller
+who asked for it. The cached data is not deleted, so if the scrape fails the old
+list is still served with `meta.refresh_error`, and calls arriving mid-scrape
+coalesce rather than queueing more work.
 
 ### Targeting a niche exactly
 
@@ -197,22 +199,41 @@ curl "localhost:8000/v1/trending?keyword=x&hashtag=sad,sadmusic,emotional"
 ## How a scrape is assembled
 
 ```
-keyword ──> hashtags (curated map, else derived from the keyword)
-              │
-              ├─ per hashtag:  /api/challenge/detail/  -> id (cached 1h)
-              │                /api/challenge/item_list/ -> 20 videos
-              │
-              └─ merged with:  /api/recommend/item_list/  (trending feed, 20)
-                         │
-                         v
-              dedupe by music.id  ──>  enrich top 30 via /api/music/detail/
-                         │                (play_link, duration, REAL video_count)
-                         v
-              rank: video_count desc, unknown last
+keyword
+   │
+   ├─ curated map? ── yes ──> its 3 hashtags
+   │      no
+   │      v
+   ├─ /api/search/general/preview/   (UNSIGNED) "what do people search with this?"
+   │      -> tagify + existence-check -> fill up to 3 hashtags
+   │      -> "derived+suggested"   (falls back to plain derivation, then "fyp")
+   │
+   v
+3 hashtags x 30 videos  +  trending feed (20)          = pool of ~110 videos
+   │
+   v
+stratified random sample of 35 videos                  = different mix each scrape
+   │  (per-source quota, so no hashtag can be squeezed out by chance)
+   v
+dedupe by music.id  ──>  enrich top 30 via /api/music/detail/
+   │                       (play_link, duration, REAL video_count)
+   v
+rank: is_niche desc  ->  video_count desc  ->  in-sample recurrence
 ```
 
 Fallback chain: hashtags + trending → trending alone → Explore feed (last
 resort, unsigned, so it still works if TikTok rotates the signer).
+
+**Every keyword gets the deep pool, not just hand-mapped ones.** The curated map
+covers ~67 keywords; anything else is expanded with TikTok's own query
+suggestions, which is what stops an unmapped word from deriving to a single tag
+(a ~50-video ceiling). Verified across mapped, unmapped and multi-word keywords:
+all seven produced 3 tags and a 110-video pool.
+
+One nuance: suggestions are **regional**, because TikTok ranks them by what is
+popular from the requesting IP — from an Asian egress `skateboarding` returned
+`skateboardingtaiwan` / `skateboardingphilippines`. On Render (Oregon) they come
+back US-oriented, like the rest of the feed.
 
 ## Usage counts
 
@@ -265,6 +286,8 @@ schedule if you want it kept warm.
 | `SCRAPE_DEADLINE_SECONDS` | `25` | Hard ceiling on one scrape |
 | `ERROR_RETRY_COOLDOWN_SECONDS` | `60` | How long an errored keyword is served before retrying |
 | `NICHE_PRIORITY` | `1` | Niche-mined sounds outrank trending-feed-only ones, regardless of usage count. `0` = rank purely by count |
+| `FRESH_BY_DEFAULT` | `1` | A request without `fresh` forces a new scrape, so every search returns a new mix. `0` = cache is authoritative |
+| `TIKTOK_SUGGEST_TAGS` | `1` | Expand an unmapped keyword with TikTok's query suggestions, so it mines 3 tags instead of 1. `0` = plain derivation |
 | `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Videos pulled per hashtag. Hard-capped at 30: TikTok rejects `count=50` (verified) |
 | `TIKTOK_POOL_SAMPLE` | `35` | Videos drawn at random from the pool before reading sounds. `0` = read the whole pool |
 | `LOG_LEVEL` | `INFO` | |

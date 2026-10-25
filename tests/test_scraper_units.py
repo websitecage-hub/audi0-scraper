@@ -236,6 +236,106 @@ def test_sampling_preserves_source_attribution(monkeypatch):
         assert s["is_niche"] == any(x.startswith("hashtag:") for x in s["sources"]), s
 
 
+# ---------------------------------------------------------------------------
+# suggestion-based expansion: any keyword must get a deep pool
+# ---------------------------------------------------------------------------
+
+def test_tagify_makes_a_hashtag_name():
+    assert scraper._tagify("Anxiety Attacks") == "anxietyattacks"
+    assert scraper._tagify("Anxiety  Songs!") == "anxietysongs"
+    assert scraper._tagify("#Deep Feelings") == "deepfeelings"
+    assert scraper._tagify("") == ""
+
+
+def test_unmapped_keyword_is_expanded_with_suggestions(monkeypatch):
+    """The general fix: an unmapped keyword must mine several hashtags, not one."""
+    monkeypatch.setattr(scraper, "suggested_terms",
+                        lambda kw, country=None, limit=12: ["Skateboarding Tricks",
+                                                            "Skateboarding Songs",
+                                                            "Skateboarding Falls"])
+    monkeypatch.setattr(scraper, "hashtag_id", lambda tag, deadline, country=None:
+                        (str(abs(hash(tag)) % 99999), {}))
+    tags, how = scraper.expand_hashtags("skateboarding")
+    assert how == "derived+suggested"
+    assert len(tags) == 3
+    assert tags[0] == "skateboarding", "the keyword's own tag stays first"
+    assert "skateboardingtricks" in tags
+
+
+def test_expansion_skips_tags_that_do_not_exist(monkeypatch):
+    """A suggested phrase is not automatically a hashtag; non-existent ones are
+    dropped rather than mined and reported as failures."""
+    def only_tricks(tag, deadline, country=None):
+        if tag != "skateboardingtricks":
+            raise scraper.TikTokNotFound(f"#{tag} does not exist")
+        return ("1", {})
+
+    monkeypatch.setattr(scraper, "suggested_terms",
+                        lambda kw, country=None, limit=12: ["Skateboarding Tricks",
+                                                            "Not A Real Tag Here",
+                                                            "Skateboarding Songs"])
+    monkeypatch.setattr(scraper, "hashtag_id", only_tricks)
+    tags, how = scraper.expand_hashtags("skateboarding")
+    assert tags == ["skateboarding", "skateboardingtricks"]
+    assert how == "derived+suggested"
+
+
+def test_expansion_falls_back_when_suggestions_are_empty(monkeypatch):
+    monkeypatch.setattr(scraper, "suggested_terms", lambda kw, country=None, limit=12: [])
+    tags, how = scraper.expand_hashtags("zzqxniche")
+    assert how == "derived"
+    assert "zzqxniche" in tags
+
+
+def test_mapped_keywords_do_not_call_the_suggestion_endpoint(monkeypatch):
+    calls = []
+    monkeypatch.setattr(scraper, "suggested_terms",
+                        lambda *a, **k: calls.append(1) or ["whatever"])
+    tags, how = scraper.expand_hashtags("gym")
+    assert how == "mapped"
+    assert calls == [], "a curated mapping must not spend a suggestions call"
+
+
+def test_expansion_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(scraper, "SUGGEST_TAGS", False)
+    monkeypatch.setattr(scraper, "suggested_terms",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
+    tags, how = scraper.expand_hashtags("zzqxniche")
+    assert how == "derived"
+
+
+# ---------------------------------------------------------------------------
+# stratified sampling: no hashtag may be squeezed out by chance
+# ---------------------------------------------------------------------------
+
+def test_sample_pool_is_stratified_across_sources():
+    """A flat random sample of 35 from 110 can miss a whole hashtag; stratifying
+    guarantees every working source contributes."""
+    sources = [("hashtag:a", [{"id": f"a{i}"} for i in range(30)]),
+               ("hashtag:b", [{"id": f"b{i}"} for i in range(30)]),
+               ("hashtag:c", [{"id": f"c{i}"} for i in range(30)]),
+               ("trending:DEFAULT", [{"id": f"t{i}"} for i in range(20)])]
+    for _ in range(20):                      # repeat: sampling is random
+        pool = scraper._sample_pool(sources, 35)
+        assert len(pool) == 35
+        labels = {label for label, _v in pool}
+        assert labels == {"hashtag:a", "hashtag:b", "hashtag:c", "trending:DEFAULT"}, labels
+
+
+def test_sample_pool_keeps_everything_when_pool_is_small():
+    sources = [("hashtag:a", [{"id": "1"}, {"id": "2"}])]
+    assert len(scraper._sample_pool(sources, 35)) == 2
+    assert len(scraper._sample_pool(sources, 0)) == 2
+
+
+def test_sample_pool_never_duplicates_a_video():
+    sources = [("hashtag:a", [{"id": f"a{i}"} for i in range(50)]),
+               ("hashtag:b", [{"id": f"b{i}"} for i in range(50)])]
+    pool = scraper._sample_pool(sources, 35)
+    ids = [v["id"] for _l, v in pool]
+    assert len(ids) == len(set(ids)) == 35
+
+
 def test_per_hashtag_count_is_capped_at_the_verified_ceiling():
     """count=50 is rejected by TikTok (TikTokBadRequest); never allow it."""
     assert scraper.VIDEOS_PER_HASHTAG <= scraper.MAX_VIDEOS_PER_HASHTAG == 30
