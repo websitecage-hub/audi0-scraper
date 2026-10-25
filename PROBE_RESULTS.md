@@ -427,6 +427,93 @@ that video's trimmed clip. So enrichment is what upgrades both the usage count
 
 ---
 
+## 10. Pool depth, sampling, and the suggestion endpoint (v2.3)
+
+### 10a. The per-hashtag count ceiling is 30
+
+The pool expansion depends on how deep one hashtag call can go:
+
+```
+#anxiety challenge/item_list count=20 -> 20 videos, cursor='20', hasMore=True
+                            count=30 -> 30 videos, cursor='30', hasMore=True
+                            count=50 -> TikTokBadRequest: tiktok rejected /api/challenge/item_list/
+```
+
+So `count` is honoured up to 30 and **rejected** at 50 — `TIKTOK_VIDEOS_PER_HASHTAG`
+is hard-capped at 30 in code, not left as a config the operator can raise into a
+guaranteed failure. The payload does expose `cursor` + `hasMore`, so pagination is
+possible; the design instead gets depth from more hashtags, which costs one
+parallel call rather than a serial page walk. (#anxiety itself has 8,071,145 videos.)
+
+### 10b. `/api/search/general/preview/` is the generic expansion source
+
+Verified UNSIGNED, login-free, from a datacenter IP — which makes it the one
+discovery surface that keeps working even if the signer rots:
+
+```
+GET /api/search/general/preview/?keyword=anxiety&count=10
+  -> {"sug_list": [{"content": "Anxiety Attacks", ...},
+                   {"content": "Anxiety Songs", ...}, ...]}
+  -> P.suggestions(payload["sug_list"]) -> ['Anxiety Attacks', 'Anxiety Songs', ...]
+```
+
+Two traps, both hit during probing: the parameter is `keyword` (`keywords`
+returns an empty `sug_list` rather than erroring), and the terms live under
+`sug_list` (not `data` / `suggestions` / `sugList`). A wrong guess here fails
+*silently* as "no suggestions".
+
+Suggestion phrases are not hashtags, so each is tagified (`Anxiety Attacks` ->
+`anxietyattacks`) and existence-checked through `challenge/detail` before use.
+That check is ~0.19s and cached for an hour, so it is cheaper than mining a tag
+that does not exist.
+
+They are also **regional**: TikTok ranks them against the requesting IP, so from
+an Asian egress `skateboarding` suggested `skateboardingtaiwan` and
+`skateboardingphilippines`. That is consistent with the rest of the design
+(content follows egress IP) but it is a real behaviour to know about.
+
+### 10c. What it changed, measured
+
+Before, only hand-mapped keywords got 3 hashtags; an unmapped word derived to
+ONE, capping its pool near 50. Across seven keywords (mapped, unmapped,
+multi-word) every one now mines 3 tags from a 110-video pool:
+
+```
+keyword                resolution           tags  pool sampled sounds enriched  secs
+gym                    mapped                  3   110      35     34       30   6.0
+anxiety                mapped                  3   110      35     34       30  11.2
+skateboarding          derived+suggested       3   110      35     34       29  12.4
+sourdough              derived+suggested       3   110      35     30       27  12.4
+thrifting              derived+suggested       3   110      35     33       28   7.5
+mechanical keyboard    derived                 3   110      35     33       29   6.0
+bouldering             derived+suggested       3   110      35     32       30   7.9
+```
+
+`mechanical keyboard` is the honest counter-example: suggestions returned nothing
+usable, it fell back to plain derivation — and still produced 3 tags from the
+multi-word split, so the fallback is not a cliff.
+
+### 10d. Sampling is stratified, not uniform
+
+A flat random draw of 35 from 110 can miss an entire hashtag by chance, leaving a
+facet of the niche invisible. `_sample_pool` allocates each source roughly its
+share with a floor of one video, so every hashtag that returned videos is always
+represented. Verified over 20 consecutive draws: all four sources present, 35
+videos out, no duplicates.
+
+### 10e. Fresh by default
+
+`FRESH_BY_DEFAULT=1`: a request without `fresh` forces a new scrape rather than
+replaying the cache, and the 202 body returns `poll_with` (the same URL with
+`fresh=false`) so a client can always converge. Repeat searches of the same
+keyword, measured:
+
+```
+thrifting  run1=20 ids  run2=20 ids  overlap=1   identical=False
+```
+
+One sound in common out of twenty, against an identical list before this change.
+
 ## Known unknowns
 
 * **The signer is the fragile part.** `tiktok/signer.py` reimplements TikTok's
@@ -444,5 +531,17 @@ that video's trimmed clip. So enrichment is what upgrades both the usage count
   datacenter IP: it needs a cookie session, and the boot is WAF-gated. Hashtag
   mining is the workaround, not a fix for that.
 * **The keyword→hashtag map is curated, so it only covers what it covers.** An
-  unmapped keyword is derived mechanically and may name a hashtag that does not
-  exist (reported in `meta.sources_failed`, saved by the trending merge).
+  unmapped keyword is now expanded with suggestions rather than derived blindly,
+  but if suggestions come back empty or unusable it falls back to a single
+  derived tag (observed once, for `mechanical keyboard`, which still produced
+  three tags from its multi-word split). What is mined either way is reported in
+  `meta`, and a tag that yields nothing lands in `meta.sources_failed`.
+* **Suggestions are regional** (section 10b): they reflect what is popular from
+  this server's IP, so the tags an unmapped keyword fans out to differ between a
+  US and an Asian egress. Same rule as the content itself, but it means two
+  deployments in different regions can return different hashtag sets.
+* **Fresh-by-default costs a scrape per search.** Every `/v1/trending` call
+  without `fresh=false` spends ~5–15s and ~5 upstream calls, where the cache
+  would have answered instantly. That is the deliberate trade for always-current
+  results; `FRESH_BY_DEFAULT=0` restores cache-first behaviour, and the polling
+  contract is unaffected either way.
