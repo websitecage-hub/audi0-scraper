@@ -1,0 +1,72 @@
+# Render Blueprint.
+#
+# Differences from the original spec, and why:
+#   * No `git clone` in buildCommand. Upstream ships no setup.py/pyproject.toml,
+#     so it is neither pip-installable nor usefully cloned-and-cd'd from a
+#     Render build (the build's cwd is not on the runtime import path). The
+#     needed subset is vendored in-repo and pinned by commit -- see
+#     vendor/UPSTREAM.md.
+#   * One process. The original spec ran the scraper's own Bottle server on
+#     port 8000 *and* uvicorn on port 8000; a Render web service runs a single
+#     start command, and a second Python server does not fit in 512 MB anyway.
+#     This service imports the scraper as a library instead.
+#   * --workers 1 is deliberate: the free instance has 0.1 vCPU, and extra
+#     workers would multiply RSS against a 512 MB cap without buying CPU.
+services:
+  - type: web
+    name: tiktok-trending-api
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 5
+    healthCheckPath: /v1/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      # In-memory cache lifetime. The spec's 10 minutes.
+      - key: CACHE_TTL_SECONDS
+        value: "600"
+      # How long a terminal "error" cache entry is served before a new scrape
+      # is allowed to start.
+      - key: ERROR_RETRY_COOLDOWN_SECONDS
+        value: "60"
+      # Retries for a blocked (403/429/empty-body) scrape, with exponential
+      # backoff. Set TIKTOK_BACKOFF_BASE=60 for the spec's original
+      # "start at 60 seconds" behaviour.
+      - key: TIKTOK_MAX_RETRIES
+        value: "2"
+      - key: TIKTOK_BACKOFF_BASE
+        value: "5"
+      # How many hashtags one keyword request mines (mapped tags + trending feed).
+      - key: TIKTOK_HASHTAG_FANOUT
+        value: "3"
+      # Videos pulled per hashtag, and from the trending feed.
+      - key: TIKTOK_VIDEOS_PER_HASHTAG
+        value: "20"
+      - key: TIKTOK_TRENDING_COUNT
+        value: "20"
+      # How many of the most promising sounds get a /api/music/details call for
+      # their real global usage count. ~0.19s per call, verified not to be
+      # retired after 25 sequential calls, so this is a latency budget cap.
+      - key: TIKTOK_ENRICH_TOP_N
+        value: "30"
+      - key: TIKTOK_ENRICH_WORKERS
+        value: "6"
+      # Hard ceiling on one scrape, so a background task can never run away.
+      # Measured: 5.3s typical, 10.3s with a blocked-hashtag retry.
+      - key: SCRAPE_DEADLINE_SECONDS
+        value: "25"
+      # Concurrent background scrapes. Keep small on 0.1 vCPU.
+      - key: MAX_CONCURRENT_SCRAPES
+        value: "2"
+      # Bound on cached keywords, so memory cannot grow without limit.
+      - key: CACHE_MAX_ENTRIES
+        value: "256"
+      # NOTE: TIKTOK_PROXY is NOT needed. The signed endpoints this build
+      # relies on (/api/challenge/detail/, /api/challenge/item_list/,
+      # /api/music/detail/, /api/recommend/item_list/) answer normally from a
+      # datacenter IP. A proxy would only be useful to change the egress
+      # location the content is skewed toward, which Render's Oregon region
+      # already sets to US.

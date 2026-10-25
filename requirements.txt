@@ -1,0 +1,14 @@
+# Runtime dependencies for the Render build.
+#
+# Every pin below installs from a prebuilt wheel on CPython 3.11 -- nothing
+# compiles from source (verified against PyPI metadata):
+#   fastapi / starlette / uvicorn / pydantic  -> py3-none-any wheels
+#   pydantic_core                             -> cp311 manylinux_2_17_x86_64 wheel
+#   curl_cffi                                 -> cp310-abi3 wheel (covers 3.10+)
+#
+# NOTE: there is deliberately no `tiktok-scraper` line here. Upstream has no
+# setup.py/pyproject.toml, so a git+https pip install fails. The needed subset
+# is vendored under ./vendor -- see vendor/UPSTREAM.md.
+fastapi==0.162.0
+uvicorn==0.54.0
+curl_cffi==0.16.3

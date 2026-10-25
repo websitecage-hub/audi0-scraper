@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test-only. httpx is required by starlette's TestClient; it is NOT a runtime
+# dependency of the service (the service imports the scraper directly rather
+# than calling it over HTTP).
+pytest==9.1.1
+httpx==0.28.1

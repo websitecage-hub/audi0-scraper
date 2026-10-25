@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TikTok Trending Audio API</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#151922; --line:#232a38; --fg:#e6ebf5; --dim:#8b97ad;
+          --accent:#25f4ee; --accent2:#fe2c55; --ok:#3ddc97; --warn:#ffb454; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .wrap { max-width:1080px; margin:0 auto; padding:28px 18px 60px; }
+  h1 { font-size:19px; margin:0 0 4px; letter-spacing:-.2px; }
+  h1 span { color:var(--accent); }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }
+  label { display:block; font-size:11px; color:var(--dim); margin-bottom:5px;
+          text-transform:uppercase; letter-spacing:.06em; }
+  input,select { background:#0b0e13; color:var(--fg); border:1px solid var(--line);
+                 border-radius:7px; padding:9px 10px; font:inherit; font-size:13px; }
+  input:focus,select:focus { outline:none; border-color:var(--accent); }
+  #kw { width:230px; }  #limit { width:80px; }  #cat { width:190px; }
+  button { background:var(--accent); color:#04202a; border:0; border-radius:7px;
+           padding:10px 18px; font:inherit; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line);
+                 font-weight:400; }
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--dim); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--accent2); }
+  .dot.busy { background:var(--warn); animation:p 1s infinite; }
+  @keyframes p { 50% { opacity:.25; } }
+  #status { font-size:12px; color:var(--dim); min-height:18px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:8px 8px; border-bottom:1px solid var(--line);
+          vertical-align:top; }
+  th { color:var(--dim); font-weight:600; font-size:10px; text-transform:uppercase;
+       letter-spacing:.07em; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .audio { color:var(--accent2); font-size:11px; }
+  pre { background:#0b0e13; border:1px solid var(--line); border-radius:7px; padding:11px;
+        overflow:auto; font-size:11px; color:var(--dim); max-height:280px; margin:0; }
+  .muted { color:var(--dim); font-size:11px; }
+  .warn { color:var(--warn); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }
+  .kpi { background:#0b0e13; border:1px solid var(--line); border-radius:8px; padding:9px 11px; }
+  .kpi b { display:block; font-size:17px; color:var(--fg); font-weight:600; }
+  .kpi i { font-style:normal; color:var(--dim); font-size:10px; text-transform:uppercase;
+           letter-spacing:.06em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>TikTok <span>Trending Audio</span> API</h1>
+  <div class="sub">Unsigned Explore-feed sampler &middot; no API key &middot; no proxy &middot; no browser</div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="pill"><span class="dot" id="dot"></span><span id="health">checking&hellip;</span></div>
+      <div class="pill"><a href="/docs">/docs</a> &middot; <a href="/v1/health">/v1/health</a>
+        &middot; <a href="/v1/trending/hashtags">/hashtags</a>
+        &middot; <a href="/v1/trending/countries">/countries</a></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><label for="kw">Keyword / niche</label><input id="kw" value="sad" placeholder="sad, gym, relationship&hellip;"></div>
+      <div><label for="tag">Hashtags (optional)</label><input id="tag" list="taglist" placeholder="sad,sadmusic,emotional"><datalist id="taglist"></datalist></div>
+      <div><label for="limit">Limit</label><input id="limit" type="number" min="1" max="50" value="20"></div>
+      <div><button id="go">Fetch trending sounds</button></div>
+      <div><button id="clr" class="ghost">Clear</button></div>
+    </div>
+    <div id="status" style="margin-top:11px"></div>
+  </div>
+
+  <div class="card" id="kpis" style="display:none">
+    <div class="grid" id="kpigrid"></div>
+  </div>
+
+  <div class="card" id="results" style="display:none">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Title / artist</th><th class="num">Dur</th><th class="num">Global uses</th>
+        <th class="num">Seen in sample</th><th class="num">Plays</th><th>Audio</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="metacard" style="display:none">
+    <label>response meta</label>
+    <pre id="meta"></pre>
+  </div>
+
+  <div class="card">
+    <label>how this works</label>
+    <div class="muted">Sounds come from <b>hashtag mining</b>: the keyword maps to real hashtags
+      (<code>/v1/trending/hashtags</code>), each hashtag's top videos are pulled, and TikTok's
+      trending feed is merged in. Each unique sound is then enriched via
+      <code>/api/music/details</code> for its <b>real global usage count</b> and audio URL, and
+      results are ranked by that count. Sounds whose enrichment failed show <code>n/a</code> and
+      sort last. A literal keyword <i>search</i> is not used &mdash; that endpoint demands a
+      login TikTok will not grant a datacenter IP.</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const api = (p) => fetch(p).then(r => r.json().then(b => ({ r, b })));
+
+async function health() {
+  try {
+    const { r, b } = await api('/v1/health');
+    const ok = r.ok && b.status === 'ok';
+    $('dot').className = 'dot ' + (ok ? 'ok' : 'bad');
+    $('health').textContent = ok
+      ? `ok v${b.version} | cache ${b.cache_entries} entries | ttl ${b.cache_ttl_seconds}s | exact usage counts: ${b.usage_counts_available ? 'yes' : 'no'}`
+      : 'degraded: ' + JSON.stringify(b).slice(0, 120);
+  } catch (e) {
+    $('dot').className = 'dot bad'; $('health').textContent = 'unreachable: ' + e;
+  }
+}
+
+async function suggest() {
+  try {
+    const { b } = await api('/v1/trending/hashtags');
+    const dl = $('taglist');
+    for (const [kw, tags] of Object.entries(b.keywords)) {
+      const o = document.createElement('option');
+      o.value = tags.join(','); o.label = kw;
+      dl.appendChild(o);
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let busy = false;
+
+async function run() {
+  if (busy) return;
+  busy = true; $('go').disabled = true;
+  $('results').style.display = 'none'; $('kpis').style.display = 'none';
+  $('metacard').style.display = 'none';
+
+  const kw = $('kw').value.trim() || 'sad';
+  const lim = Math.min(50, Math.max(1, parseInt($('limit').value || '20', 10)));
+  const tag = $('tag').value.trim();
+  let url = `/v1/trending?keyword=${encodeURIComponent(kw)}&limit=${lim}`;
+  if (tag) url += `&hashtag=${encodeURIComponent(tag)}`;
+
+  const t0 = Date.now();
+  for (let attempt = 1; attempt <= 30; attempt++) {
+    let r, b;
+    try { ({ r, b } = await api(url)); }
+    catch (e) { $('status').textContent = 'network error: ' + e; break; }
+
+    if (b.status === 'ready') {
+      $('status').innerHTML = `<span class="dot ok"></span> ready in ${((Date.now()-t0)/1000).toFixed(1)}s`
+        + (b.meta && b.meta.stale ? ' <span class="warn">(serving cached data; refreshing in background)</span>' : '')
+        + (b.meta && b.meta.refresh_error ? ` <span class="warn">(refresh failed: ${b.meta.refresh_error})</span>` : '');
+      render(b); break;
+    }
+    if (b.status === 'error') {
+      $('status').innerHTML = `<span class="dot bad"></span> error: ${b.error || 'unknown'}`;
+      renderMeta(b); break;
+    }
+    const wait = (b.retry_after_seconds || 5);
+    $('status').innerHTML = `<span class="dot busy"></span> processing (attempt ${attempt})`
+      + ` &mdash; ${b.message || 'poll again'} ` + (b.queue_position ? `[queue ${b.queue_position}]` : '');
+    await sleep(wait * 1000);
+  }
+  busy = false; $('go').disabled = false;
+}
+
+function render(b) {
+  const d = b.data || [];
+  $('results').style.display = d.length ? 'block' : 'none';
+  $('kpis').style.display = d.length ? 'block' : 'none';
+  const m = b.meta || {};
+  $('kpigrid').innerHTML = [
+    ['sounds returned', d.length],
+    ['videos sampled', m.videos_sampled ?? '-'],
+    ['unique sounds', m.sounds_considered ?? '-'],
+    ['hashtags mined', (m.hashtags_sampled || []).join(', ') || '-'],
+    ['sounds enriched', `${m.sounds_enriched ?? '-'} / ${m.sounds_considered ?? '-'}`],
+    ['scrape seconds', m.elapsed_seconds ?? '-'],
+  ].map(([k, v]) => `<div class="kpi"><b>${escapeHtml(String(v))}</b><i>${k}</i></div>`).join('');
+
+  $('tbody').innerHTML = d.map((s, i) => `
+    <tr>
+      <td class="num muted">${i + 1}</td>
+      <td>${escapeHtml(s.title || '(untitled)')}<br><span class="muted">${escapeHtml(s.artist || 'unknown artist')}</span>
+        ${s.is_original_sound ? '<span class="muted"> &middot; original</span>' : ''}</td>
+      <td class="num">${s.duration_seconds ?? '-'}s</td>
+      <td class="num">${s.video_count == null ? '<span class="warn">n/a</span>' : fmt(s.video_count)}</td>
+      <td class="num">${s.sample_frequency}</td>
+      <td class="num">${fmt(s.sample_plays)}</td>
+      <td><a class="audio" href="${escapeAttr(s.play_link)}" target="_blank" rel="noopener">open audio &#8599;</a>
+        ${s.tiktok_url ? `<br><a class="muted" href="${escapeAttr(s.tiktok_url)}" target="_blank" rel="noopener">tiktok page</a>` : ''}</td>
+    </tr>`).join('');
+  renderMeta(b);
+}
+
+function renderMeta(b) {
+  $('metacard').style.display = 'block';
+  $('meta').textContent = JSON.stringify(b.meta || { status: b.status, error: b.error }, null, 2);
+}
+
+function fmt(n) {
+  if (n == null) return '-';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+const escapeHtml = s => s.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const escapeAttr = escapeHtml;
+
+$('go').onclick = run;
+$('clr').onclick = () => {
+  $('results').style.display = 'none'; $('kpis').style.display = 'none';
+  $('metacard').style.display = 'none'; $('status').textContent = '';
+};
+$('kw').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+
+health(); suggest();
+setInterval(health, 30000);
+</script>
+</body>
+</html>
