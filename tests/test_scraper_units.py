@@ -269,6 +269,8 @@ def test_equal_counts_fall_back_to_in_sample_recurrence():
     ("relationship", "couplegoals"),
     ("gaming", "gamingontiktok"),
     ("skincare", "skincareroutine"),
+    ("anxiety", "mentalhealth"),
+    ("overthinking", "anxiety"),
 ])
 def test_mapping_hits_the_curated_table(keyword, must_include):
     tags, how = scraper.resolve_hashtags(keyword)

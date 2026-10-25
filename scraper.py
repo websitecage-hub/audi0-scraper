@@ -140,6 +140,12 @@ KEYWORD_HASHTAGS: dict[str, list[str]] = {
     "crying": ["sadmusic", "sad", "emotional"],
     "depressed": ["sadmusic", "mentalhealth", "emotional"],
     "lonely": ["sadmusic", "emotional", "lonely"],
+    # Mental-health niches: every tag below was verified to resolve AND list 30
+    # videos. Without these entries a single-word keyword derives to ONE tag,
+    # which caps the pool at ~50 videos instead of ~110.
+    "anxiety": ["anxiety", "mentalhealth", "anxietyrelief"],
+    "mentalhealth": ["mentalhealth", "anxiety", "overthinking"],
+    "overthinking": ["overthinking", "anxiety", "mentalhealth"],
     "relationship": ["relationship", "couplegoals", "dating"],
     "love": ["love", "couplegoals", "lovestory"],
     "breakup": ["breakup", "heartbreak", "sadmusic"],
