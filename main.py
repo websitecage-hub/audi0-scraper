@@ -52,7 +52,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import scraper
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 # ---------------------------------------------------------------------------
 # Config
