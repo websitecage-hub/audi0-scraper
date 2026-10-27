@@ -245,6 +245,10 @@ def _filter_sounds(data: list[dict], *, exclude_original: bool, duration_min: in
         permission.
       * `exclude_original` drops only an explicit `true`, so a sound with an
         unknown flag is kept rather than lost.
+      * `min_niche_frequency` uses `pool_frequency` -- the same term the ranking
+        uses -- falling back to `sample_frequency`. Using the sampled count here
+        while ranking on the pool count would make the filter and the ordering
+        disagree about what "in this niche" means.
     """
     def keep(s: dict) -> bool:
         if exclude_original and s.get("is_original_sound"):
@@ -257,7 +261,9 @@ def _filter_sounds(data: list[dict], *, exclude_original: bool, duration_min: in
             return False
         if duration_max is not None and (dur is None or dur > duration_max):
             return False
-        if min_niche_frequency is not None and (s.get("sample_frequency") or 0) < min_niche_frequency:
+        if min_niche_frequency is not None and (
+                (s.get("pool_frequency") or s.get("sample_frequency") or 0)
+                < min_niche_frequency):
             return False
         if commercial_ok and not s.get("is_commercial_use_allowed"):
             return False

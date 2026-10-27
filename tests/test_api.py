@@ -396,6 +396,18 @@ def test_poll_with_preserves_filters(client, monkeypatch):
     assert body["poll_with"].endswith("fresh=false")
 
 
+def test_min_niche_frequency_prefers_pool_frequency(client, monkeypatch):
+    """The filter must use the same term as the ranking: a sound used twice in
+    the pool but only once in the random sample still counts as repeated."""
+    fake = FilterFakeScraper()
+    fake.records = [dict(FILTER_SET[0], pool_frequency=2, sample_frequency=1),
+                    dict(FILTER_SET[1], pool_frequency=1, sample_frequency=1)]
+    _mock(monkeypatch, fake)
+    client.get("/v1/trending?keyword=sad&limit=50")
+    b = client.get("/v1/trending?keyword=sad&limit=50&min_niche_frequency=2&fresh=false").json()
+    assert [s["id"] for s in b["data"]] == ["a"]
+
+
 def test_health_reports_the_fresh_default(client, monkeypatch):
     monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
     assert client.get("/health").json()["fresh_by_default"] is True
