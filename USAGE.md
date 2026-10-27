@@ -193,7 +193,7 @@ requests cache-first again.
 | `usage_basis` | Where `video_count` came from: `upstream_music_details`, `unavailable_enrichment_failed`, `not_enriched`. |
 | `is_niche` | `true` = found via the keyword's own hashtags; `false` = came only from the shared trending feed. |
 | `sample_frequency` | How many of the *sampled* videos used this sound (the random subset). |
-| `pool_frequency` | How many videos in the **whole niche pool** (~110) used this sound. This is the ranking term. |
+| `pool_frequency` | How many videos in the **whole niche pool** (~200) used this sound. This is the ranking term. |
 | `pool_spread` | How many distinct sources (hashtags / trending feed) carried it. |
 | `rank_score` | The blended rank: `pool_frequency x log10(video_count + 1)`. Exposed so you can see why a track sits where it does. |
 | `sample_plays` / `sample_likes` | Engagement summed across those videos. |
@@ -215,7 +215,7 @@ Niche-mined sounds come first, then by **`rank_score`**, a niche-local blend:
     rank_score = pool_frequency x log10(video_count + 1)
 
 `pool_frequency` is how many videos **in this niche's pool** used the sound
-(~110 videos: 30 per hashtag x 3 + the trending feed). It is what makes the
+(~200 videos: 30 x 2 pages x 5 hashtags + the trending feed). It is what makes the
 ranking niche-local — the frequency term has to come from the niche, because the
 usage count is global. A sound that 6 of those videos used with 60k global uses
 scores 6 x 4.78 = 28.7 and outranks a global hit with one appearance and 4M uses
@@ -278,6 +278,24 @@ Filters can legitimately empty the list — you get `200` with `"data": []` and
 happens, loosen one filter or raise `limit`, since filtering happens before the
 `limit` is applied.
 
+### Pool depth and strict filters
+
+Depth exists so that demanding filter combinations still have something to
+select from. The pool is ~200 videos (30 x 2 pages x 5 hashtags + the trending
+feed), sampled down to 90 at random for reading. Verified live onRender across
+gym / sad / coding, twice each: the strict combination
+`exclude_original=true&duration_min=30&duration_max=90` returned
+**17/13, 7/8 and 11/7 tracks** — never below 5.
+
+Pagination follows upstream's `cursor` + `hasMore`; a page walk stops on
+`hasMore=false`, an empty page, or a scrape deadline within 2s, so depth can
+never cost the latency bound. The scrape still runs in a background task (202 →
+poll), so the edge timeout is untouched.
+
+The sample stays a *minority fraction* of the pool on purpose: reading the whole
+pool was measured to make consecutive searches overlap heavily (13–17 of 20),
+which would undo the fresh-mix behaviour.
+
 ---
 
 ## 5. `meta` — what the scrape actually did
@@ -287,8 +305,8 @@ happens, loosen one filter or raise `limit`, since filtering happens before the
 | `hashtag_resolution` | `mapped`, `derived+suggested`, `derived`, `explicit`, `empty-keyword`. |
 | `hashtags_requested` / `hashtags_sampled` | What was asked for vs what returned videos. |
 | `sources` / `sources_failed` | Per-source outcome. A partial failure is normal; only a total failure errors. |
-| `videos_fetched` | Size of the pool pulled (~110). |
-| `videos_sampled` | How many of those were read (`TIKTOK_POOL_SAMPLE`, default 35). |
+| `videos_fetched` | Size of the pool pulled (~200; up to ~320 when all 5 tags paginate). |
+| `videos_sampled` | How many of those were read (`TIKTOK_POOL_SAMPLE`, default 90). |
 | `sample_strategy` | `stratified_by_source` or `whole_pool`. |
 | `rank_mode` / `blended_rank` | `blended` (niche-local score) or `usage_priority`; which knob is active. |
 | `frequency_basis` | `pool` — the frequency term is measured over the whole pool. |
@@ -444,11 +462,12 @@ Set as environment variables on the service; defaults are sane.
 | `BLENDED_RANK` | `1` | Order within the niche tier by `pool_frequency x log10(usage)` instead of raw global usage. `0` = usage order. |
 | `TIKTOK_SUGGEST_TAGS` | `1` | Expand unmapped keywords with TikTok suggestions. |
 | `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Hard cap; TikTok rejects `count=50`. |
-| `TIKTOK_POOL_SAMPLE` | `35` | Videos read per scrape from the pool. |
-| `TIKTOK_HASHTAG_FANOUT` | `3` | Hashtags mined per keyword. |
-| `TIKTOK_ENRICH_TOP_N` | `30` | Sounds given a real usage count. |
+| `TIKTOK_POOL_SAMPLE` | `90` | Videos read per scrape from the pool (~a third of it, to keep repeat searches varied). |
+| `TIKTOK_HASHTAG_FANOUT` | `5` | Hashtags mined per keyword. |
+| `TIKTOK_HASHTAG_PAGES` | `2` | Pages per hashtag (cursor pagination; 30 x 2 = up to 60 per tag). |
+| `TIKTOK_ENRICH_TOP_N` | `45` | Sounds given a real usage count. |
+| `SCRAPE_DEADLINE_SECONDS` | `45` | Ceiling on one background scrape (the HTTP request still answers 202 immediately). |
 | `TIKTOK_MAX_RETRIES` / `TIKTOK_BACKOFF_BASE` | `2` / `5` | Retry/backoff on a block. |
-| `SCRAPE_DEADLINE_SECONDS` | `25` | Ceiling on one scrape. |
 | `CACHE_TTL_SECONDS` | `600` | Cache lifetime for `fresh=false`. |
 | `MAX_CONCURRENT_SCRAPES` | `2` | Keep small on 0.1 vCPU. |
 | `CACHE_MAX_ENTRIES` | `256` | Memory bound. |
