@@ -206,6 +206,49 @@ requests cache-first again.
 
 ```
 is_niche desc          (NICHE_PRIORITY)
+  -> music first       (MUSIC_FIRST)   -- titled songs above original clips
+  -> rank_score desc   (BLENDED_RANK) -- in-pool frequency x log10(global usage)
+    -> video_count desc -> pool_frequency desc
+```
+
+**Audio facets.** Each scrape also mines the niche's AUDIO communities --
+`{kw}music`, `{kw}songs`, `{kw}vibes` (the 2 strongest by real video_count,
+from `TIKTOK_AUDIO_FACETS`). These tags carry the niche word in the name, so
+they cannot drift, and they bring 85-95% sounds the plain niche tags never
+surface — mostly titled music, which is what the music filters need. See
+`meta.audio_facets` for what a search actually mined. Skipped for explicit
+`?hashtag=` requests (you chose the tags already).
+
+**Music first.** A niche's own videos are 63-93% "original sound" clips, so
+frequency ranking buried real songs below the top of the list. Titled music now
+ranks above original clips within the niche tier, using TikTok's structural
+`is_original_sound` flag (never title prefixes — "original sound" is spelled
+differently in every language). Measured effect: the strict combo
+(`exclude_original=true` + a duration window) went from 3-11 results to 8-18
+live, per niche, on both consecutive runs.
+
+### The niche-relevance story (why a sound you didn't search for still belongs)
+
+The semantic gap: the audio a niche runs on is rarely named like the niche.
+Gym videos run on phonk and slowed R&B, not "gym music". The service bridges it
+in two steps, both measured in the v3.0.0 campaign (PROBE_RESULTS.md section 11):
+
+1. **Discovery:** the niche's audio communities are found by name
+   (`gym` -> `#gymvibes` 293k videos, `#gymmusic` 105k) — on-topic by
+   construction, because the tag name contains the niche word.
+2. **Ranking:** titled music outranks creator voice-clips, so what surfaces at
+   the top of a niche search is its actual music, not the 70-93% original-sound
+   background noise.
+
+Ideas tested and rejected along the way (kept in the log so they are not
+retried): co-occurrence vocabulary mining (nothing there), suggestion second
+hops (drift into unrelated languages/entities), and observing a sound's usage
+context directly (the endpoint is blocked from datacenter IPs).
+
+### Ordering details
+
+```
+is_niche desc          (NICHE_PRIORITY)
   -> rank_score desc   (BLENDED_RANK) -- in-pool frequency x log10(global usage)
     -> video_count desc -> pool_frequency desc
 ```
@@ -460,6 +503,8 @@ Set as environment variables on the service; defaults are sane.
 | `FRESH_BY_DEFAULT` | `1` | Plain requests always scrape. `0` = cache-first. |
 | `NICHE_PRIORITY` | `1` | Niche sounds rank above trending-only ones. |
 | `BLENDED_RANK` | `1` | Order within the niche tier by `pool_frequency x log10(usage)` instead of raw global usage. `0` = usage order. |
+| `MUSIC_FIRST` | `1` | Titled music ranks above original-sound clips within the niche tier. `0` = score order only. |
+| `TIKTOK_AUDIO_FACETS` | `2` | Mine the niche's audio communities (`{kw}music`, `{kw}songs`...), strongest 2 by video_count. `0` = off. |
 | `TIKTOK_SUGGEST_TAGS` | `1` | Expand unmapped keywords with TikTok suggestions. |
 | `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Hard cap; TikTok rejects `count=50`. |
 | `TIKTOK_POOL_SAMPLE` | `90` | Videos read per scrape from the pool (~a third of it, to keep repeat searches varied). |

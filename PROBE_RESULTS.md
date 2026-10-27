@@ -514,6 +514,81 @@ thrifting  run1=20 ids  run2=20 ids  overlap=1   identical=False
 
 One sound in common out of twenty, against an identical list before this change.
 
+## 11. The semantic-bridge campaign (v3.0.0, 2026-10-28)
+
+Question that started it: the audio a niche runs on is not named like the niche
+(gym videos run on phonk and slowed R&B, not "gym music") -- can we find the
+niche's music anyway? Eleven experiments, run in order, each deciding the next:
+
+* **exp1 -- co-occurrence mining: DEAD END.** Mined 90 #gymtok/#gym/#workout
+  videos for co-occurring audio hashtags (#phonk, #spedup...): found 2 across
+  302 distinct tags, and 63/90 videos carried "original sound". The niche does
+  not tag its audio.
+* **exp2/exp2b -- niche-anchored audio tags: THE BRIDGE, but shapes matter.**
+  {kw}music/{kw}songs/{kw}vibes exist as real communities -- #sadsongs has
+  907,858 videos, #gymmusic 104,995, #sadvibes 16.4M -- and bring 85-95% sounds
+  the plain niche tags never surface. (A first read said "100% non-original
+  music" -- that was a probe bug reading the wrong field shape; the true
+  original-sound share of #sadsongs is ~98%. Honest correction recorded here.)
+* **exp3 -- suggestion second hop for song titles: DEAD END.** Suggestions are
+  what people TYPE ("sad songs to cry to"), never song titles, and hop-2 drifts
+  into unrelated languages and entities (sad -> sade -> sadevillagelombok).
+* **exp4/4b -- observing a sound's usage context: BLOCKED.**
+  /api/music/item_list/ answers TikTokBadRequest from this IP in every param
+  shape tried; /api/music/videos/ answers "url doesn't match". Direct
+  measurement of "is this sound used in this niche" is not available to us.
+* **exp5 -- semantic fields in video/music payloads: NULL.**
+  suggested_searches is always null; the music payload contributes `album`,
+  `is_commerce_music`, `tt2dsp` (streaming links) -- metadata, not semantics.
+* **exp6 (corrected shapes) -- facets add 106-120 new sounds per niche**, and
+  their music skews TITLED (LAIDTEKK, HUNTER (Ultra Slowed), beamer boy) with
+  median durations 22-33s vs 60s+ in niche tags.
+* **exp7 -- sibling overlap.** #gymmusic vs #gymsongs share 21/30 videos;
+  #sadvibes vs #sadsongs share 0/30. Conclusion: mine the 2 strongest facets
+  by video_count, not several siblings.
+* **exp9/9b -- facets alone can LOWER strict yield** (gym mean 14.5 -> 7.5 at
+  facets=2): frequency ranking still buries titled music under the pool's
+  original-sound majority. Facets change WHAT is in the pool; ranking decides
+  whether it surfaces.
+* **exp11 -- the ranking insight: MUSIC-FIRST.** Re-ranking the same pool with
+  titled music first (structural `is_original_sound` flag -- never title
+  prefixes, because "original sound" is spelled nha.c ne^`n / suara asli /
+  صوت أصلي / 原聲 / son original / оригинальный звук ...) tripled the strict
+  yield on every niche: gym 11->28, sad 3->11, coding 5->22, wedding 6->19,
+  cooking 8->24.
+
+### Shipped as v3.0.0
+
+`audio_facets()` probes {kw}{songs,music,vibes,audio,phonk,playlist} (parallel
+existence checks, ranked by real video_count, top 2 mined alongside the niche
+tags; skipped for explicit `?hashtag=` requests); `_order_key` gains the
+music-first tier inside the niche tier; `meta.audio_facets`,
+`meta.music_first`, `health.music_first` expose all of it. Knobs:
+`TIKTOK_AUDIO_FACETS` (2), `MUSIC_FIRST` (1).
+
+### Live result (Render, v3.0.0, 2 runs per niche)
+
+Strict combo `exclude_original=true&duration_min=30&duration_max=90`:
+
+```
+gym     18, 18    ('GYM (Ultra Slowed)' 249k uses, 'petal' 267k, 'BRUTALISM (Slowed)')
+sad      9,  9    ('August 10' 173k, 'Little Things' 10.5M, 'Harvey' 119k)
+coding  14,  8    ('Tonight' 240k, 'Paper Moon Static' 929k, 'Island In The Sun' 650k)
+```
+
+All six runs >= 5; scrapes 10.6-15.9s against the 45s background deadline;
+the HTTP contract is unchanged (202 -> poll with fresh=false).
+
+### Rejected ideas, with reasons (so future-us does not retry them)
+
+* Suggestion second-hop: drift + zero song titles (exp3).
+* music->videos context observation: endpoint blocked (exp4).
+* Co-occurrence vocabulary: nothing there (exp1).
+* Reading the whole pool: destroys repeat-search variety (measured 13-17/20
+  overlap in the v2.4 campaign).
+* Title-prefix "original sound" detection: incomplete in every language;
+  the structural flag exists and is exact.
+
 ## Known unknowns
 
 * **The signer is the fragile part.** `tiktok/signer.py` reimplements TikTok's
