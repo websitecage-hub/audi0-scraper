@@ -489,6 +489,7 @@ def trending(
             # Auditable from the query response itself, not just /v1/health.
             "niche_priority": scraper.NICHE_PRIORITY,
             "blended_rank": scraper.BLENDED_RANK,
+            "music_first": scraper.MUSIC_FIRST,
             "rank_mode": "blended" if scraper.BLENDED_RANK else "usage_priority",
             "niche_sounds": sum(1 for s in capped if s.get("is_niche")),
             "trending_only_sounds": sum(1 for s in capped if not s.get("is_niche")),
@@ -532,6 +533,7 @@ def _health_body(probe: bool = False) -> dict:
         "usage_counts_available": scraper.usage_counts_available(),
         "niche_priority": scraper.NICHE_PRIORITY,
         "blended_rank": scraper.BLENDED_RANK,
+        "music_first": scraper.MUSIC_FIRST,
         "rank_mode": "blended" if scraper.BLENDED_RANK else "usage_priority",
         "fresh_by_default": FRESH_BY_DEFAULT,
         "source": "tiktok_hashtag_mining",

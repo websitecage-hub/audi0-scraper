@@ -112,6 +112,44 @@ ENRICH_WORKERS = int(os.environ.get("TIKTOK_ENRICH_WORKERS", "6"))
 # scrape deadline is close, so depth never costs the request its latency bound.
 HASHTAG_PAGES = max(1, int(os.environ.get("TIKTOK_HASHTAG_PAGES", "2")))
 
+# ---------------------------------------------------------------------------
+# Audio facets: niche-anchored AUDIO communities ({kw}music, {kw}songs, ...)
+#
+# Seven experiments (2026-10-28, see PROBE_RESULTS.md section 11) established:
+#   * a niche's own videos are ~70% "original sound" and its hashtags carry
+#     almost NO audio vocabulary -- the audio a niche runs on is not named
+#     like the niche (exp1);
+#   * but {kw}music / {kw}songs / {kw}vibes EXIST as real communities
+#     (#sadsongs 908k videos, #gymmusic 105k) and bring 85-95% sounds the
+#     plain niche tag never surfaces -- mostly TITLED music, which is exactly
+#     what the strict filters need (exp6);
+#   * sibling audio tags overlap heavily with each other (#gymmusic vs
+#     #gymsongs: 21/30 videos), so take only the best few by video_count
+#     (exp7);
+#   * suggestions do NOT contain song titles, and observing a sound's usage
+#     context is blocked (/api/music/item_list/ -> TikTokBadRequest), so the
+#     tag NAME carrying the niche word is the on-topic guarantee we have.
+# The name containing the keyword is what keeps this drift-free where a plain
+# second hop of suggestions was not.
+AUDIO_SUFFIXES = ("songs", "music", "vibes", "audio", "phonk", "playlist")
+AUDIO_FACETS = max(0, int(os.environ.get("TIKTOK_AUDIO_FACETS", "2")))
+
+# Music-first ordering. Experiments 6-11 (PROBE_RESULTS.md section 11) showed
+# why it matters: a niche's own videos are ~70-93% "original sound", so ranking
+# by niche frequency puts creator voice clips above actual songs -- and a strict
+# filter for real music (exclude_original + a duration window) could then find
+# almost nothing near the top of the list. Ordering non-original sounds first
+# inside the niche tier raised the strict yield 3-4x on every niche measured
+# (gym 11->28, sad 3->11, coding 5->22, wedding 6->19, cooking 8->24).
+#
+# The split uses the STRUCTURAL `is_original_sound` flag from TikTok, never the
+# title: "original sound" is spelled differently in every language (nhạc nền,
+# suara asli, الصوت الأصلي, 原聲, son original...) and a prefix list can never
+# be complete. A sound with an unknown flag ranks as music, but since it also
+# has no usage count it sorts last within the group anyway.
+MUSIC_FIRST = os.environ.get("MUSIC_FIRST", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+
 # How many of the most promising sounds get a /music/details call. Each call is
 # ~0.19s and was verified NOT to be retired after 25 sequential calls, so this
 # cap is about bounding one request's latency, not about evading a rate limit.
@@ -331,6 +369,42 @@ def suggested_terms(keyword: str, country=None, limit: int = 12) -> list[str]:
         log.info("suggestions unavailable for %r: %s", keyword, exc)
         return []
     return P.suggestions(payload.get("sug_list")) or []
+
+
+def audio_facets(keyword: str, deadline: float, country=None,
+                 want: int = AUDIO_FACETS) -> list[tuple[str, int]]:
+    """Niche-anchored AUDIO tags: {kw}songs, {kw}music, {kw}vibes...
+
+    The semantic bridge the plain mining misses (see AUDIO_SUFFIXES for the
+    experiment log): a niche's own videos run on music that is not named like
+    the niche, but the niche's AUDIO communities -- #gymmusic, #sadsongs,
+    #gymvibes -- are real, sizeable, and ~85-95% full of sounds the plain
+    niche tags never surface. The tag name containing the keyword is the
+    on-topic guarantee; ranking candidates by real video_count picks the
+    strongest communities.
+
+    Returns up to `want` (tag, video_count) pairs, best first. An empty
+    result is normal for niches with no audio community (#codingphonk) and
+    costs only the existence checks.
+    """
+    if want <= 0:
+        return []
+    kw = _tagify(keyword)
+    if not kw or kw in _STOPWORDS or len(kw) > 30:
+        return []
+    candidates = [f"{kw}{s}" for s in AUDIO_SUFFIXES]
+
+    def probe(tag: str) -> tuple[str, int] | None:
+        try:
+            _id, ch = hashtag_id(tag, deadline, country)
+            return tag, int(ch.get("video_count") or 0)
+        except Exception:                        # noqa: BLE001 - a miss is a miss
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates))) as pool:
+        found = [r for r in pool.map(probe, candidates) if r]
+    found.sort(key=lambda x: -x[1])
+    return found[:want]
 
 
 def expand_hashtags(keyword: str, explicit: str | None = None, deadline: float | None = None,
@@ -689,24 +763,31 @@ def _rank_score(r: dict) -> float:
 
 
 def _order_key(r: dict):
-    """Niche sounds first (under NICHE_PRIORITY), then -- under BLENDED_RANK --
-    by the niche-local blended score rather than raw global usage.
+    """Niche sounds first (under NICHE_PRIORITY), then music before
+    original-sound clips (under MUSIC_FIRST), then the blended niche score.
 
     With NICHE_PRIORITY on, a niche sound with 5,000 uses outranks a generic
     trending sound with 200,000 uses: the trending feed is shared by every
     keyword, so ranking on count alone lets it dominate every niche.
 
-    With BLENDED_RANK on, ordering inside that tier is by `rank_score`
+    With MUSIC_FIRST on, titled music outranks "original sound" clips within
+    its niche tier. Measured effect: the strict combination (exclude_original +
+    a duration window) went from 3-11 to 11-28 results in the top 50 across
+    five niches, because without it the ~70-93% original-sound share of a
+    niche's videos buried the music below the cut.
+
+    With BLENDED_RANK on, ordering inside that group is by `rank_score`
     (recurrence x log usage) rather than by usage count, which is what stops
-    global popularity from leaking into niches. Both knobs off = pure global
-    usage count, the original behaviour. `is_niche` and `rank_score` are on
-    every record either way, so clients can re-rank.
+    global popularity from leaking into niches. `is_niche`, `rank_score` and
+    `is_original_sound` are on every record either way, so clients can re-rank.
     """
     vc = r["video_count"]
     niche_tier = 0 if (not NICHE_PRIORITY or r.get("is_niche")) else 1
+    music_tier = (1 if r.get("is_original_sound") else 0) if MUSIC_FIRST else 0
     if BLENDED_RANK and vc is not None:
         return (
             niche_tier,                       # niche sounds first when priority is on
+            music_tier,                       # titled music above original clips
             -(r.get("rank_score") or 0.0),    # then the blended niche score, desc
             -(vc or 0),                       # then global usage, desc (ties)
             -r["sample_frequency"],           # then in-sample recurrence
@@ -715,6 +796,7 @@ def _order_key(r: dict):
         )
     return (
         niche_tier,                           # niche sounds first when priority is on
+        music_tier,
         0 if vc is not None else 1,          # known counts before unknown, within tier
         -(vc or 0),                           # then by global usage, desc
         -r["sample_frequency"],               # then in-sample recurrence
@@ -746,12 +828,26 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
     tags, resolution = expand_hashtags(keyword, explicit=hashtag, deadline=deadline,
                                        country=country)
 
+    # Audio facets ({kw}music, {kw}songs...): the niche's audio communities.
+    # Skipped for explicit hashtag requests -- the caller already chose their
+    # tags, so second-guessing them would be rude -- and skipped when the
+    # keyword is long enough that {kw}songs could never be a real tag name.
+    facets: list[tuple[str, int]] = []
+    if AUDIO_FACETS and not hashtag and keyword and len(keyword) <= 24:
+        try:
+            facets = audio_facets(keyword, deadline, country)
+        except Exception as exc:              # noqa: BLE001 - best effort, always
+            log.info("audio facets unavailable for %r: %s", keyword, exc)
+            facets = []
+    facet_tags = [t for t, _vc in facets]
+
     sources: list[tuple[str, list[dict]]] = []
     failed: list[dict] = []
 
-    # --- 1. hashtag mining (parallel) -------------------------------------
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tags)))) as pool:
-        futures = {pool.submit(hashtag_videos, t, deadline, country): t for t in tags}
+    # --- 1. hashtag mining (parallel: niche tags + audio facets) -----------
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(tags) + len(facet_tags)))) as pool:
+        futures = {pool.submit(hashtag_videos, t, deadline, country): t
+                   for t in tags + facet_tags}
         for future in as_completed(futures):
             tag = futures[future]
             try:
@@ -888,6 +984,7 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         "hashtags_requested": tags,
         "hashtags_sampled": [label.split(":", 1)[1] for label, _v in sources
                              if label.startswith("hashtag:")],
+        "audio_facets": [{"tag": t, "video_count": vc} for t, vc in facets],
         "sources": [label for label, _v in sources],
         "sources_failed": failed,
         "fallback_used": fallback_used,
@@ -898,6 +995,7 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         "fresh": bool(fresh),
         "rank_mode": "blended" if BLENDED_RANK else "usage_priority",
         "blended_rank": BLENDED_RANK,
+        "music_first": MUSIC_FIRST,
         "frequency_basis": "pool",
         "sounds_considered": len(records),
         "sounds_enriched": len(enriched_map),

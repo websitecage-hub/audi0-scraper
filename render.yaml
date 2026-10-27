@@ -92,6 +92,17 @@ services:
       # appeared in it once.
       - key: BLENDED_RANK
         value: "1"
+      # Titled music ranks above "original sound" clips within the niche tier.
+      # A niche's own videos are 70-93% original sounds, which buried real music
+      # below the top-50 cut; music-first raised the strict filter yield 3-4x.
+      - key: MUSIC_FIRST
+        value: "1"
+      # Mine the niche's AUDIO communities ({kw}music, {kw}songs, ...) alongside
+      # the niche tags. They exist as real tags (#sadsongs 908k videos) and are
+      # much richer in titled music; 2 facets balanced new-sound discovery
+      # against latency (11s scrapes) and repeat-search variety.
+      - key: TIKTOK_AUDIO_FACETS
+        value: "2"
       # Fresh results by default: a search that does not pass `fresh` forces a
       # new scrape, so the same keyword returns a new mix instead of the cached
       # list. Polls pass fresh=false. Set to "0" to make the cache authoritative.

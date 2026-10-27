@@ -182,6 +182,7 @@ def _video_n(i):
 
 
 def _patch_sources(monkeypatch, n_hashtag=30, n_trending=20, tags=3):
+    """Fake the two video sources and disable live audio-facet probing."""
     def fake_hashtag_videos(tag, deadline, country=None):
         return [_video_n(f"{tag}-{i}") for i in range(n_hashtag)]
 
@@ -191,6 +192,7 @@ def _patch_sources(monkeypatch, n_hashtag=30, n_trending=20, tags=3):
     monkeypatch.setattr(scraper, "hashtag_videos", fake_hashtag_videos)
     monkeypatch.setattr(scraper, "trending_videos", fake_trending)
     monkeypatch.setattr(scraper, "music_details", lambda *a, **k: None)
+    monkeypatch.setattr(scraper, "audio_facets", lambda *a, **k: [])
 
 
 def test_pool_is_sampled_not_read_whole(monkeypatch):
@@ -211,6 +213,44 @@ def test_pool_sampling_can_be_disabled(monkeypatch):
     m = scraper.fetch_trending_sounds("sad", limit=20)["meta"]
     assert m["videos_sampled"] == m["videos_fetched"] == 110
     assert m["pool_sample"] is None
+
+
+def test_audio_facets_extend_the_pool_and_are_labelled(monkeypatch):
+    """The semantic bridge: {kw}music/{kw}songs tags must be mined alongside the
+    niche tags, attributed as their own source, and reported in meta."""
+    _patch_sources(monkeypatch)
+
+    def facets(kw, deadline, country=None, want=2):
+        return [("sadmusic", 530_050), ("sadsongs", 907_855)][:want]
+
+    monkeypatch.setattr(scraper, "audio_facets", facets)
+    monkeypatch.setattr(scraper, "AUDIO_FACETS", 2)
+    r = scraper.fetch_trending_sounds("sad", limit=50)
+    m = r["meta"]
+    labels = " ".join(m["sources"])
+    assert "hashtag:sadmusic" in labels and "hashtag:sadsongs" in labels
+    assert [f["tag"] for f in m["audio_facets"]] == ["sadmusic", "sadsongs"]
+    # 3 niche tags + 2 facets, each 30, + trending 20
+    assert m["videos_fetched"] == 5 * 30 + 20
+
+
+def test_audio_facets_can_be_disabled(monkeypatch):
+    _patch_sources(monkeypatch)
+    monkeypatch.setattr(scraper, "AUDIO_FACETS", 0)
+    m = scraper.fetch_trending_sounds("sad", limit=50)["meta"]
+    assert m["audio_facets"] == []
+    assert m["videos_fetched"] == 3 * 30 + 20
+
+
+def test_explicit_hashtag_requests_skip_facets(monkeypatch):
+    """A caller who names their tags has spoken; do not add ours."""
+    _patch_sources(monkeypatch)
+    called = []
+    monkeypatch.setattr(scraper, "audio_facets",
+                        lambda *a, **k: called.append(1) or [])
+    m = scraper.fetch_trending_sounds("x", limit=50, hashtag="sad,sadmusic")["meta"]
+    assert called == []
+    assert m["audio_facets"] == []
 
 
 def test_repeated_scrapes_return_a_different_mix(monkeypatch):
@@ -407,6 +447,56 @@ def test_every_record_carries_rank_score():
                         [{"stats": {}}], {"hashtag:gym"}, enriched=True)
     assert r is not None
     assert "rank_score" in r and r["rank_score"] == scraper._rank_score(r)
+
+
+# ---------------------------------------------------------------------------
+# music-first ordering: titled songs above original-sound clips
+# ---------------------------------------------------------------------------
+
+def test_music_first_puts_titled_songs_above_original_clips(monkeypatch):
+    monkeypatch.setattr(scraper, "MUSIC_FIRST", True)
+    monkeypatch.setattr(scraper, "BLENDED_RANK", True)
+    monkeypatch.setattr(scraper, "NICHE_PRIORITY", True)
+    music = _sound("song", freq=1, vc=5000)
+    clip = _sound("clip", freq=3, vc=50000)
+    music["is_original_sound"] = False
+    clip["is_original_sound"] = True
+    for r in (music, clip):
+        r["rank_score"] = scraper._rank_score(r)
+    assert scraper._order_key(music) < scraper._order_key(clip), \
+        "a titled song must outrank a more-used original-sound clip"
+
+
+def test_music_first_off_restores_score_order(monkeypatch):
+    monkeypatch.setattr(scraper, "MUSIC_FIRST", False)
+    monkeypatch.setattr(scraper, "BLENDED_RANK", True)
+    music = _sound("song", freq=1, vc=5000)
+    clip = _sound("clip", freq=3, vc=50000)
+    music["is_original_sound"] = False
+    clip["is_original_sound"] = True
+    for r in (music, clip):
+        r["rank_score"] = scraper._rank_score(r)
+    assert scraper._order_key(clip) < scraper._order_key(music)
+
+
+def test_audio_facet_probing_is_bounded_and_sorted(monkeypatch):
+    """Facets must come back ranked by real video_count, capped at `want`."""
+    def fake_id(tag, deadline, country=None):
+        counts = {"sadsongs": 907855, "sadmusic": 530050, "sadvibes": 16364114,
+                  "sadaudio": 96546, "sadphonk": None}   # None = does not exist
+        if tag not in counts or counts[tag] is None:
+            raise scraper.TikTokNotFound(tag)
+        return "1", {"video_count": counts[tag]}
+
+    monkeypatch.setattr(scraper, "hashtag_id", fake_id)
+    out = scraper.audio_facets("sad", deadline=scraper.time.monotonic() + 30, want=2)
+    assert [t for t, _vc in out] == ["sadvibes", "sadsongs"], \
+        "ranked by video_count, non-existent tags dropped"
+
+
+def test_audio_facets_skipped_for_garbage_keywords():
+    assert scraper.audio_facets("!!!", deadline=0) == []
+    assert scraper.audio_facets("x" * 60, deadline=0) == []
 
 
 def test_per_hashtag_count_is_capped_at_the_verified_ceiling():
