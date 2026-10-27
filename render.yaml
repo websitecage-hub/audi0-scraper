@@ -75,6 +75,12 @@ services:
       # "0" to rank purely by real usage count.
       - key: NICHE_PRIORITY
         value: "1"
+      # Order inside that niche tier by a niche-LOCAL blended score
+      # (in-sample recurrence x log10(global usage)) instead of by raw global usage
+      # count, so a sound saturating this niche outranks a global hit that merely
+      # appeared in it once.
+      - key: BLENDED_RANK
+        value: "1"
       # Fresh results by default: a search that does not pass `fresh` forces a
       # new scrape, so the same keyword returns a new mix instead of the cached
       # list. Polls pass fresh=false. Set to "0" to make the cache authoritative.

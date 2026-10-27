@@ -38,6 +38,7 @@ Asia-skewed content.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import threading
@@ -115,6 +116,23 @@ BACKOFF_BASE_SECONDS = float(os.environ.get("TIKTOK_BACKOFF_BASE", "5"))
 # viral audio cannot crowd a niche out of its own results. Each track carries
 # `is_niche` either way, so a client can re-rank. Accepts 0/false/no/off.
 NICHE_PRIORITY = os.environ.get("NICHE_PRIORITY", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+
+# Ranking inside that tier. Ranking purely on the global usage count leaks
+# global popularity into every niche: the sound with the most uses *anywhere on
+# TikTok* wins every keyword it happens to appear in. Measured before this knob
+# existed, two unrelated niches (thrifting, sourdough) both put the same sound
+# at rank 1. BLENDED_RANK orders by a niche-LOCAL score instead:
+#
+#     rank_score = in-sample frequency x log10(global usage + 1)
+#
+# The frequency term (how many of the sampled videos in THIS niche used the
+# sound, 1..POOL_SAMPLE) is what makes it niche-local; the log keeps a truly
+# enormous sound ahead of an obscure one without letting 4M uses drown out a
+# sound that 8 of 35 sampled niche videos actually used. Both terms are needed:
+# frequency alone crowns a sound used by three throwaway videos.
+# Each record carries `rank_score`, so a client can verify or re-rank.
+BLENDED_RANK = os.environ.get("BLENDED_RANK", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
 
 # In-process caches. Hashtag ids are stable for hours; a sound's usage count
@@ -559,7 +577,8 @@ def music_details(music_id: str, deadline: float, country=None,
 # ---------------------------------------------------------------------------
 
 def _record(music: dict, videos_using: list[dict], sources: set[str],
-            enriched: bool) -> dict | None:
+            enriched: bool, pool_frequency: int = 0,
+            pool_spread: int = 0) -> dict | None:
     """One output sound. `music` is the enriched /music/details object when
     available, otherwise the music object embedded in the video."""
     play_link = _absolute_url(music.get("play_link"))
@@ -578,7 +597,7 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
         usage_basis = "unavailable_enrichment_failed" if enriched else "not_enriched"
 
     source_list = sorted(sources)
-    return {
+    record = {
         "id": str(music.get("id")),
         "title": music.get("title"),
         "artist": music.get("author_name"),
@@ -591,6 +610,13 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
 
         # In-sample signals, kept so a client can re-rank or audit.
         "sample_frequency": len(videos_using),
+        # How many videos in the WHOLE pool used this sound -- the ranking
+        # signal. Higher-resolution than sample_frequency and the term the
+        # blended score multiplies, because a 35-video sample can only record
+        # a saturating sound once or twice.
+        "pool_frequency": pool_frequency or len(videos_using),
+        # How many distinct sources (hashtags / the trending feed) carried it.
+        "pool_spread": pool_spread,
         "sample_plays": plays,
         "sample_likes": likes,
         "sources": source_list,
@@ -606,21 +632,56 @@ def _record(music: dict, videos_using: list[dict], sources: set[str],
         "is_copyrighted": music.get("is_copyrighted"),
         "streaming_links": music.get("streaming_links") or [],
     }
+    # The ranking key, exposed so a client can see WHY a track sits where it
+    # does (and re-rank on its own terms if it disagrees).
+    record["rank_score"] = _rank_score(record)
+    return record
+
+
+def _rank_score(r: dict) -> float:
+    """Blended niche rank: in-niche recurrence x log10(global usage + 1).
+
+    A sound that 8 of the pool's videos used with 60k global uses scores
+    8 x 4.78 = 38.2 and outranks a global hit with one appearance and 4M uses
+    (1 x 6.60 = 6.6). Either term missing scores 0, which sorts last rather than
+    inventing a rank for a sound we could not measure.
+
+    The frequency term is `pool_frequency` (measured across the whole pool)
+    rather than `sample_frequency` (only the random sample), falling back to the
+    latter for records built before that distinction existed.
+    """
+    freq = r.get("pool_frequency") or r.get("sample_frequency") or 0
+    vc = r.get("video_count")
+    if freq <= 0 or vc is None:
+        return 0.0
+    return round(freq * math.log10(max(int(vc), 1) + 1), 3)
 
 
 def _order_key(r: dict):
-    """Niche sounds first (under NICHE_PRIORITY), then by REAL global usage
-    count; sounds whose enrichment failed sort last within their tier, ordered
-    by in-sample recurrence.
+    """Niche sounds first (under NICHE_PRIORITY), then -- under BLENDED_RANK --
+    by the niche-local blended score rather than raw global usage.
 
     With NICHE_PRIORITY on, a niche sound with 5,000 uses outranks a generic
     trending sound with 200,000 uses: the trending feed is shared by every
-    keyword, so ranking on count alone lets it dominate every niche. Turn the
-    knob off to rank purely by usage count. `is_niche` is on every record
-    either way, so clients can re-rank.
+    keyword, so ranking on count alone lets it dominate every niche.
+
+    With BLENDED_RANK on, ordering inside that tier is by `rank_score`
+    (recurrence x log usage) rather than by usage count, which is what stops
+    global popularity from leaking into niches. Both knobs off = pure global
+    usage count, the original behaviour. `is_niche` and `rank_score` are on
+    every record either way, so clients can re-rank.
     """
     vc = r["video_count"]
     niche_tier = 0 if (not NICHE_PRIORITY or r.get("is_niche")) else 1
+    if BLENDED_RANK and vc is not None:
+        return (
+            niche_tier,                       # niche sounds first when priority is on
+            -(r.get("rank_score") or 0.0),    # then the blended niche score, desc
+            -(vc or 0),                       # then global usage, desc (ties)
+            -r["sample_frequency"],           # then in-sample recurrence
+            -r["sample_plays"],
+            (r["title"] or "").lower(),
+        )
     return (
         niche_tier,                           # niche sounds first when priority is on
         0 if vc is not None else 1,          # known counts before unknown, within tier
@@ -706,6 +767,28 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
     videos_fetched = sum(len(videos) for _label, videos in sources)
     videos_sampled = len(pool)
 
+    # Frequency measured over the WHOLE pool, not just the random sample.
+    #
+    # This is what makes the blended rank work. With a 35-video sample a
+    # saturating sound appears once or twice, so sample_frequency was nearly
+    # constant (mean 1.07) and multiplying by it changed almost nothing. The
+    # full pool is already in memory -- it is the list the sample is drawn from
+    # -- so counting across all ~110-170 of its videos costs no extra upstream
+    # call and distinguishes "used by 6 videos in this niche" from "used once".
+    #
+    # The returned list still comes from the small random sample, so consecutive
+    # searches keep returning a different mix; only the MEASUREMENT got bigger.
+    pool_frequency: dict[str, int] = {}
+    pool_spread: dict[str, set[str]] = {}
+    for label, videos in sources:
+        for video in videos:
+            music = video.get("music")
+            if not isinstance(music, dict) or not music.get("id"):
+                continue
+            mid = str(music["id"])
+            pool_frequency[mid] = pool_frequency.get(mid, 0) + 1
+            pool_spread.setdefault(mid, set()).add(label)
+
     # --- 5. dedupe by music id -------------------------------------------
     by_music: dict[str, dict] = {}
     for label, video in pool:
@@ -723,7 +806,8 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
 
     # --- 5. enrich the most promising N with real usage counts -----------
     candidates = list(by_music.items())
-    candidates.sort(key=lambda kv: (-len(kv[1]["videos"]),
+    candidates.sort(key=lambda kv: (-pool_frequency.get(kv[0], 0),
+                                    -len(kv[1]["videos"]),
                                     -(kv[1]["music"].get("duration_seconds") or 0)))
     to_enrich = candidates[:max(0, ENRICH_TOP_N)]
 
@@ -747,7 +831,9 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
     for key, acc in candidates:
         detail = enriched_map.get(key)
         music = detail if detail else acc["music"]
-        record = _record(music, acc["videos"], acc["sources"], enriched=detail is not None)
+        record = _record(music, acc["videos"], acc["sources"], enriched=detail is not None,
+                         pool_frequency=pool_frequency.get(key, 0),
+                         pool_spread=len(pool_spread.get(key) or ()))
         if record:
             records.append(record)
 
@@ -779,6 +865,9 @@ def fetch_trending_sounds(keyword, limit=20, country=None, hashtag=None, deadlin
         "pool_sample": POOL_SAMPLE or None,
         "sample_strategy": "stratified_by_source" if POOL_SAMPLE else "whole_pool",
         "fresh": bool(fresh),
+        "rank_mode": "blended" if BLENDED_RANK else "usage_priority",
+        "blended_rank": BLENDED_RANK,
+        "frequency_basis": "pool",
         "sounds_considered": len(records),
         "sounds_enriched": len(enriched_map),
         "sounds_with_usage_count": with_count,

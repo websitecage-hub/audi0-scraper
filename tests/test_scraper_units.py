@@ -336,6 +336,79 @@ def test_sample_pool_never_duplicates_a_video():
     assert len(ids) == len(set(ids)) == 35
 
 
+# ---------------------------------------------------------------------------
+# blended niche ranking: recurrence x log(global usage)
+# ---------------------------------------------------------------------------
+
+def _sound(sid, freq, vc, dur=60, original=False, commercial=None, plays=0):
+    return {"id": sid, "title": f"t{sid}", "sample_frequency": freq,
+            "video_count": vc, "duration_seconds": dur,
+            "is_original_sound": original, "is_commercial_use_allowed": commercial,
+            "sample_plays": plays, "is_niche": True}
+
+
+def test_rank_score_is_frequency_times_log_usage():
+    import math
+    r = scraper._record({"id": "1", "title": "t", "play_link": "http://x/a.mp3",
+                         "duration_seconds": 60, "video_count": 60000},
+                        [{"stats": {}}] * 8, {"hashtag:gym"}, enriched=True)
+    assert r is not None
+    assert r["rank_score"] == round(8 * math.log10(60001), 3)
+
+
+def test_niche_saturation_beats_global_popularity():
+    """The whole point: a sound saturating the niche must outrank a global hit
+    that merely appeared in it once."""
+    niche = _sound("niche", freq=8, vc=60_000)
+    global_hit = _sound("global", freq=1, vc=4_000_000)
+    assert scraper._rank_score(niche) > scraper._rank_score(global_hit)
+
+
+def test_rank_score_is_zero_without_measurable_terms():
+    assert scraper._rank_score(_sound("a", freq=0, vc=1_000)) == 0.0
+    assert scraper._rank_score(_sound("b", freq=5, vc=None)) == 0.0
+
+
+def test_blended_rank_orders_by_score_not_raw_usage(monkeypatch):
+    monkeypatch.setattr(scraper, "BLENDED_RANK", True)
+    monkeypatch.setattr(scraper, "NICHE_PRIORITY", True)
+    records = [_sound("global", freq=1, vc=4_000_000),
+               _sound("niche", freq=8, vc=60_000)]
+    for r in records:
+        r["rank_score"] = scraper._rank_score(r)
+    records.sort(key=scraper._order_key)
+    assert [r["id"] for r in records] == ["niche", "global"]
+
+
+def test_blended_rank_off_restores_raw_usage_order(monkeypatch):
+    monkeypatch.setattr(scraper, "BLENDED_RANK", False)
+    monkeypatch.setattr(scraper, "NICHE_PRIORITY", True)
+    records = [_sound("global", freq=1, vc=4_000_000),
+               _sound("niche", freq=8, vc=60_000)]
+    for r in records:
+        r["rank_score"] = scraper._rank_score(r)
+    records.sort(key=scraper._order_key)
+    assert [r["id"] for r in records] == ["global", "niche"]
+
+
+def test_unenriched_sounds_sort_last_under_blended_rank(monkeypatch):
+    """No usage count means no score, so it cannot outrank a measured sound."""
+    monkeypatch.setattr(scraper, "BLENDED_RANK", True)
+    records = [_sound("unknown", freq=9, vc=None), _sound("known", freq=1, vc=100)]
+    for r in records:
+        r["rank_score"] = scraper._rank_score(r)
+    records.sort(key=scraper._order_key)
+    assert [r["id"] for r in records] == ["known", "unknown"]
+
+
+def test_every_record_carries_rank_score():
+    r = scraper._record({"id": "1", "title": "t", "play_link": "http://x/a.mp3",
+                         "duration_seconds": 30, "video_count": 500},
+                        [{"stats": {}}], {"hashtag:gym"}, enriched=True)
+    assert r is not None
+    assert "rank_score" in r and r["rank_score"] == scraper._rank_score(r)
+
+
 def test_per_hashtag_count_is_capped_at_the_verified_ceiling():
     """count=50 is rejected by TikTok (TikTokBadRequest); never allow it."""
     assert scraper.VIDEOS_PER_HASHTAG <= scraper.MAX_VIDEOS_PER_HASHTAG == 30

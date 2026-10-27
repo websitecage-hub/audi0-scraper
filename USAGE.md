@@ -112,9 +112,19 @@ so any monitor configuration works.
 | `fresh` | bool | *server default = true* | See section 3. |
 | `refresh` | bool | `false` | Serve the cached value now and refresh behind the request. |
 | `country` | string | — | 2-letter code, forwarded as TikTok's `region`. Does **not** change content (see section 7). |
+| `exclude_original` | bool | `false` | Drop sounds TikTok flags as `original sound`. Use this when you want actual music, not a creator's voice-over. |
+| `duration_min` | int | — | Minimum `duration_seconds`. `30` for Reels-friendly clips. |
+| `duration_max` | int | — | Maximum `duration_seconds`. `90` is a sane upper bound. |
+| `min_usage` | int | — | Minimum real global usage count. Sounds whose count could not be read are **excluded** while this is set. |
+| `min_niche_frequency` | int | — | Keep only sounds used by at least N videos in the niche pool. `2` means "not a one-off". |
+| `commercial_ok` | bool | `false` | Keep only sounds flagged commercially usable. An *unknown* flag is excluded — unknown is not permission. |
 
-Errors: `400` if you supply neither `keyword` nor `hashtag`, or if a hashtag
-contains illegal characters.
+Filters are applied **at read time**, on the cached scrape. One scrape serves
+every filter combination, so they cost nothing upstream and never trigger a
+second scrape. `limit` and the filters compose freely.
+
+Errors: `400` if you supply neither `keyword` nor `hashtag`, if a hashtag
+contains illegal characters, or if `duration_min` is greater than `duration_max`.
 
 ### `GET /v1/trending/hashtags`
 
@@ -182,7 +192,10 @@ requests cache-first again.
 | `video_count` | **Real global usage count** — how many videos use this sound. `null` if enrichment failed (never `0`, which would be a lie). |
 | `usage_basis` | Where `video_count` came from: `upstream_music_details`, `unavailable_enrichment_failed`, `not_enriched`. |
 | `is_niche` | `true` = found via the keyword's own hashtags; `false` = came only from the shared trending feed. |
-| `sample_frequency` | How many of the sampled videos used this sound. |
+| `sample_frequency` | How many of the *sampled* videos used this sound (the random subset). |
+| `pool_frequency` | How many videos in the **whole niche pool** (~110) used this sound. This is the ranking term. |
+| `pool_spread` | How many distinct sources (hashtags / trending feed) carried it. |
+| `rank_score` | The blended rank: `pool_frequency x log10(video_count + 1)`. Exposed so you can see why a track sits where it does. |
 | `sample_plays` / `sample_likes` | Engagement summed across those videos. |
 | `sources` | Which hashtags (and/or the trending feed) produced it. |
 | `tiktok_url` | Link to the sound's TikTok page. |
@@ -192,12 +205,78 @@ requests cache-first again.
 ### Ordering
 
 ```
-is_niche desc  ->  video_count desc  ->  sample_frequency desc
+is_niche desc          (NICHE_PRIORITY)
+  -> rank_score desc   (BLENDED_RANK) -- in-pool frequency x log10(global usage)
+    -> video_count desc -> pool_frequency desc
 ```
 
-Niche-mined sounds come first (so generic viral audio cannot crowd out a niche),
-then by real usage count. Sounds with no usage count sort last *within their
-tier*. Set `NICHE_PRIORITY=0` to rank purely by usage count.
+Niche-mined sounds come first, then by **`rank_score`**, a niche-local blend:
+
+    rank_score = pool_frequency x log10(video_count + 1)
+
+`pool_frequency` is how many videos **in this niche's pool** used the sound
+(~110 videos: 30 per hashtag x 3 + the trending feed). It is what makes the
+ranking niche-local — the frequency term has to come from the niche, because the
+usage count is global. A sound that 6 of those videos used with 60k global uses
+scores 6 x 4.78 = 28.7 and outranks a global hit with one appearance and 4M uses
+(1 x 6.60 = 6.6).
+
+Why measure frequency across the whole pool rather than just the sampled videos:
+a 35-video sample records a saturating sound only once or twice, so the term was
+nearly constant (mean 1.07) and the blend barely changed anything. The pool is
+already in memory, so counting across all of it costs no extra request. The list
+you receive still comes from the random sample, so repeat searches stay varied —
+only the measurement got bigger.
+
+Sounds with no readable usage count score 0 and sort last. Set
+`BLENDED_RANK=0` to order by raw global usage count instead, and
+`NICHE_PRIORITY=0` to rank purely by usage count across both tiers. Every record
+carries `is_niche`, `rank_score`, `video_count` and `pool_frequency`, so a client
+can always re-rank on its own terms.
+
+**It is aggressive at low frequency**: because 1 -> 2 doubles the score, a sound
+used twice in the pool can leapfrog a sound with 100x its global usage. That is
+the intended trade (niche saturation beats global fame), but if you want a
+gentler blend, use `?min_niche_frequency=2` to drop the one-offs, or rank on
+`video_count` client-side using the fields above.
+
+### Filtering
+
+The filters exist so you do not have to post-process. The combination that
+matters most for background-music automation — real music, clip-friendly length,
+not a one-off, commercially usable:
+
+```bash
+curl "https://audi0-scraper.onrender.com/v1/trending?keyword=gym\
+&exclude_original=true&duration_min=30&duration_max=90\
+&min_niche_frequency=2&commercial_ok=true&fresh=false"
+```
+
+Each filter answers a specific problem:
+
+| You want | Parameter |
+|---|---|
+| Music, not a creator's voice-over | `exclude_original=true` |
+| Reels/Shorts-length clips | `duration_min=30&duration_max=90` |
+| Sounds that are actually spreading in the niche | `min_niche_frequency=2` |
+| To skip the long tail of 3-use sounds | `min_usage=50000` |
+| Anything you can legally use in a commercial video | `commercial_ok=true` |
+
+Every response reports what happened to your filters:
+
+```json
+"meta": {
+  "filters_applied": {"exclude_original": true, "duration_min": 30, "duration_max": 90},
+  "sounds_before_filters": 33,
+  "sounds_after_filters": 11,
+  "filtered_out": 22
+}
+```
+
+Filters can legitimately empty the list — you get `200` with `"data": []` and
+`filtered_out` equal to everything the scrape found, not an error. If that
+happens, loosen one filter or raise `limit`, since filtering happens before the
+`limit` is applied.
 
 ---
 
@@ -211,6 +290,9 @@ tier*. Set `NICHE_PRIORITY=0` to rank purely by usage count.
 | `videos_fetched` | Size of the pool pulled (~110). |
 | `videos_sampled` | How many of those were read (`TIKTOK_POOL_SAMPLE`, default 35). |
 | `sample_strategy` | `stratified_by_source` or `whole_pool`. |
+| `rank_mode` / `blended_rank` | `blended` (niche-local score) or `usage_priority`; which knob is active. |
+| `frequency_basis` | `pool` — the frequency term is measured over the whole pool. |
+| `filters_applied` / `sounds_before_filters` / `sounds_after_filters` / `filtered_out` | What your query filters did to the list. |
 | `sounds_considered` / `sounds_enriched` / `sounds_returned` | Funnel. |
 | `niche_priority`, `niche_sounds`, `trending_only_sounds` | Ranking mode and the split. |
 | `fresh` | Whether this result came from a forced scrape. |
@@ -359,6 +441,7 @@ Set as environment variables on the service; defaults are sane.
 |---|---|---|
 | `FRESH_BY_DEFAULT` | `1` | Plain requests always scrape. `0` = cache-first. |
 | `NICHE_PRIORITY` | `1` | Niche sounds rank above trending-only ones. |
+| `BLENDED_RANK` | `1` | Order within the niche tier by `pool_frequency x log10(usage)` instead of raw global usage. `0` = usage order. |
 | `TIKTOK_SUGGEST_TAGS` | `1` | Expand unmapped keywords with TikTok suggestions. |
 | `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Hard cap; TikTok rejects `count=50`. |
 | `TIKTOK_POOL_SAMPLE` | `35` | Videos read per scrape from the pool. |
@@ -379,6 +462,8 @@ Set as environment variables on the service; defaults are sane.
 |---|---|
 | Always `202`, never `ready` | You are polling with `fresh=true` (or omitting it, with fresh default on). Poll with `fresh=false`, or just follow `poll_with`. |
 | Same songs every time | You are passing `fresh=false` on the first request. Omit it. |
+| Filters return nothing | Loosen a filter, or raise `limit` — filtering happens before the limit. Check `meta.filtered_out`. |
+| `exclude_original` removed a favourite | TikTok flagged it `is_original_sound: true`; that flag is TikTok's, not ours. |
 | `video_count` is `null` | That sound's usage lookup failed; it sorts last. Other rows still have counts. |
 | Fewer than `limit` results | The pool genuinely held fewer usable sounds — check `meta.sounds_considered`. |
 | `400 invalid hashtag(s)` | Tags may only contain letters, digits, underscores. |

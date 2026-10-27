@@ -261,6 +261,141 @@ def test_explicit_fresh_false_never_scrapes_a_warm_entry(client, monkeypatch):
     assert len(fake.calls) == 1
 
 
+# ---------------------------------------------------------------------------
+# query filters (read-time; must never trigger a scrape)
+# ---------------------------------------------------------------------------
+
+def _filt_sound(sid, dur, original, commercial, vc, freq):
+    return {"id": sid, "title": f"t{sid}", "artist": "a",
+            "play_link": f"https://cdn/{sid}.mp3", "duration_seconds": dur,
+            "video_count": vc, "usage_basis": "upstream_music_details",
+            "sample_frequency": freq, "sample_plays": 0, "sample_likes": 0,
+            "sources": ["hashtag:sad"], "is_niche": True,
+            "is_original_sound": original, "is_commercial_use_allowed": commercial,
+            "rank_score": 0.0}
+
+
+FILTER_SET = [
+    _filt_sound("a", 45, False, True, 100_000, 5),   # music, mid, commercial
+    _filt_sound("b", 20, True, False, 50_000, 3),    # original, short
+    _filt_sound("c", 120, False, None, 200_000, 1),  # music, long, flag unknown
+    _filt_sound("d", 60, True, True, None, 2),       # original, count unknown
+]
+
+
+class FilterFakeScraper:
+    def __init__(self):
+        self.calls = []
+        self._i = 0
+        self.records = FILTER_SET
+
+    def __call__(self, keyword, limit=20, country=None, hashtag=None, deadline=None,
+                 fresh=False):
+        self.calls.append(keyword)
+        self._i += 1
+        return {"sounds": self.records, "meta": {"keyword": keyword, "fresh": bool(fresh)}}
+
+
+def _ready_with_filters(client, monkeypatch, query, **sound_set):
+    """One scrape, then read back through the filters. Returns (ids, meta, fake)."""
+    fake = _mock(monkeypatch, FilterFakeScraper())
+    client.get(f"/v1/trending?keyword=sad&limit=50")            # cold -> scrape
+    body = client.get(f"/v1/trending?keyword=sad&limit=50&{query}").json()
+    assert body["status"] == "ready", body
+    return [s["id"] for s in body["data"]], body["meta"], fake
+
+
+def test_exclude_original_drops_original_sounds(client, monkeypatch):
+    ids, meta, _f = _ready_with_filters(client, monkeypatch, "exclude_original=true")
+    assert ids == ["a", "c"]
+    assert meta["filtered_out"] == 2
+    assert meta["filters_applied"] == {"exclude_original": True}
+
+
+def test_duration_window_filters_for_reels_lengths(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "duration_min=30&duration_max=90")
+    assert ids == ["a", "d"]
+
+
+def test_duration_min_alone(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "duration_min=30")
+    assert ids == ["a", "c", "d"]
+
+
+def test_duration_max_alone(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "duration_max=90")
+    assert ids == ["a", "b", "d"]
+
+
+def test_min_usage_drops_unknown_and_low_counts(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "min_usage=100000")
+    assert ids == ["a", "c"], "unknown (None) and sub-threshold counts must both go"
+
+
+def test_min_niche_frequency_removes_one_offs(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "min_niche_frequency=3")
+    assert ids == ["a", "b"]
+
+
+def test_commercial_ok_requires_a_positive_flag(client, monkeypatch):
+    ids, _m, _f = _ready_with_filters(client, monkeypatch, "commercial_ok=true")
+    assert ids == ["a", "d"], "an unknown commercial flag is not permission"
+
+
+def test_filters_compose(client, monkeypatch):
+    ids, meta, _f = _ready_with_filters(
+        client, monkeypatch, "exclude_original=true&duration_min=30&duration_max=90")
+    assert ids == ["a"]
+    assert meta["filters_applied"] == {"exclude_original": True,
+                                       "duration_min": 30, "duration_max": 90}
+
+
+def test_no_filters_leaves_everything_and_reports_none(client, monkeypatch):
+    ids, meta, _f = _ready_with_filters(client, monkeypatch, "")
+    assert ids == ["a", "b", "c", "d"]
+    assert meta["filters_applied"] is None
+    assert meta["filtered_out"] == 0
+    assert meta["sounds_before_filters"] == meta["sounds_after_filters"] == 4
+
+
+def test_filters_never_trigger_a_second_scrape(client, monkeypatch):
+    """Filters are read-time, so asking 6 ways costs one scrape."""
+    fake = _mock(monkeypatch, FilterFakeScraper())
+    client.get("/v1/trending?keyword=sad&limit=50")
+    for q in ("exclude_original=true", "duration_min=30", "duration_max=30",
+              "min_usage=999999", "min_niche_frequency=5", "commercial_ok=true"):
+        body = client.get(f"/v1/trending?keyword=sad&limit=50&{q}&fresh=false").json()
+        assert body["status"] == "ready", q
+    assert len(fake.calls) == 1, "a filter must not cause an upstream scrape"
+
+
+def test_filters_may_empty_the_list_without_erroring(client, monkeypatch):
+    ids, meta, _f = _ready_with_filters(client, monkeypatch,
+                                        "min_usage=999999999&exclude_original=true")
+    assert ids == []
+    assert meta["filtered_out"] == 4
+    assert meta["sounds_before_filters"] == 4
+
+
+def test_inverted_duration_window_is_a_400(client, monkeypatch):
+    _mock(monkeypatch, FilterFakeScraper())
+    r = client.get("/v1/trending?keyword=sad&duration_min=90&duration_max=30")
+    assert r.status_code == 400
+    assert "duration_min" in r.json()["error"]
+
+
+def test_poll_with_preserves_filters(client, monkeypatch):
+    """A 202 must hand back a polling URL that keeps the caller's filters, or a
+    filtered client would poll an unfiltered query."""
+    monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
+    _mock(monkeypatch, FilterFakeScraper())
+    body = client.get("/v1/trending?keyword=sad&exclude_original=true&duration_min=30").json()
+    assert body["status"] == "processing"
+    assert "exclude_original=true" in body["poll_with"]
+    assert "duration_min=30" in body["poll_with"]
+    assert body["poll_with"].endswith("fresh=false")
+
+
 def test_health_reports_the_fresh_default(client, monkeypatch):
     monkeypatch.setattr(main, "FRESH_BY_DEFAULT", True)
     assert client.get("/health").json()["fresh_by_default"] is True

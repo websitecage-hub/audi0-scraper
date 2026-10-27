@@ -218,7 +218,8 @@ stratified random sample of 35 videos                  = different mix each scra
 dedupe by music.id  ──>  enrich top 30 via /api/music/detail/
    │                       (play_link, duration, REAL video_count)
    v
-rank: is_niche desc  ->  video_count desc  ->  in-sample recurrence
+rank: is_niche desc  ->  rank_score desc  (pool_frequency x log10(usage))
+      ->  video_count desc  ->  pool_frequency desc
 ```
 
 Fallback chain: hashtags + trending → trending alone → Explore feed (last
@@ -286,6 +287,7 @@ schedule if you want it kept warm.
 | `SCRAPE_DEADLINE_SECONDS` | `25` | Hard ceiling on one scrape |
 | `ERROR_RETRY_COOLDOWN_SECONDS` | `60` | How long an errored keyword is served before retrying |
 | `NICHE_PRIORITY` | `1` | Niche-mined sounds outrank trending-feed-only ones, regardless of usage count. `0` = rank purely by count |
+| `BLENDED_RANK` | `1` | Order inside the niche tier by `pool_frequency x log10(video_count)`, a niche-local score, instead of raw global usage. `0` = usage order |
 | `FRESH_BY_DEFAULT` | `1` | A request without `fresh` forces a new scrape, so every search returns a new mix. `0` = cache is authoritative |
 | `TIKTOK_SUGGEST_TAGS` | `1` | Expand an unmapped keyword with TikTok's query suggestions, so it mines 3 tags instead of 1. `0` = plain derivation |
 | `TIKTOK_VIDEOS_PER_HASHTAG` | `30` | Videos pulled per hashtag. Hard-capped at 30: TikTok rejects `count=50` (verified) |

@@ -20,10 +20,17 @@ Changed by the pivot:
 
 Endpoint contract
 -----------------
-GET /v1/trending?keyword=&limit=&country=&hashtag=&refresh=
+GET /v1/trending?keyword=&limit=&country=&hashtag=&refresh=&fresh=
+                 &exclude_original=&duration_min=&duration_max=
+                 &min_usage=&min_niche_frequency=&commercial_ok=
   202 {"status":"processing", ...}      scrape started or already running; poll
   200 {"status":"ready","data":[...]}   sounds available (may be stale + refreshing)
   200 {"status":"error", ...}           terminal failure; retried after a cooldown
+
+Ranking: is_niche (NICHE_PRIORITY) -> rank_score (BLENDED_RANK, a niche-local
+blend of in-pool frequency x log10(global usage)) -> video_count -> frequency.
+The filters below are applied at READ time on the cached scrape, so they cost no
+upstream work and never start a second scrape.
 
 GET /v1/health               200 {"status":"ok", ...}   (GET + HEAD, +/- slash)
 GET /v1/trending/hashtags    200 keyword -> hashtag map
@@ -45,7 +52,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import scraper
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -217,6 +224,48 @@ def scrape_and_cache(key: str, keyword: str, country: str | None, hashtag: str |
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Read-time filters
+# ---------------------------------------------------------------------------
+
+def _filter_sounds(data: list[dict], *, exclude_original: bool, duration_min: int | None,
+                   duration_max: int | None, min_usage: int | None,
+                   min_niche_frequency: int | None, commercial_ok: bool) -> list[dict]:
+    """Apply the query filters to a cached result.
+
+    Deliberately a READ-time operation: one scrape fills the cache for every
+    filter combination, so a filtered request costs nothing upstream and never
+    triggers a second scrape. It also means `limit` and the filters compose --
+    you can ask for the top 20 Reels-usable tracks without scraping again.
+
+    Filtering is honest about unknown values:
+      * `min_usage` drops sounds whose usage count could not be read, because
+        "unknown" cannot be shown to exceed a floor.
+      * `commercial_ok` keeps only a positive `true`; an unknown flag is not
+        permission.
+      * `exclude_original` drops only an explicit `true`, so a sound with an
+        unknown flag is kept rather than lost.
+    """
+    def keep(s: dict) -> bool:
+        if exclude_original and s.get("is_original_sound"):
+            return False
+        vc = s.get("video_count")
+        if min_usage is not None and (vc is None or vc < min_usage):
+            return False
+        dur = s.get("duration_seconds")
+        if duration_min is not None and (dur is None or dur < duration_min):
+            return False
+        if duration_max is not None and (dur is None or dur > duration_max):
+            return False
+        if min_niche_frequency is not None and (s.get("sample_frequency") or 0) < min_niche_frequency:
+            return False
+        if commercial_ok and not s.get("is_commercial_use_allowed"):
+            return False
+        return True
+
+    return [s for s in data if keep(s)]
+
+
 @app.get("/v1/trending")
 def trending(
     request: Request,
@@ -230,6 +279,18 @@ def trending(
                                 description="Explicit hashtag(s), comma-separated: 'sad,sadmusic'. Skips the keyword mapping and works on its own."),
     refresh: bool = Query(False, description="Refresh in the background while serving the cached value immediately (stale-while-revalidate)."),
     fresh: bool | None = Query(None, description="true = bypass the cache and scrape now (the default). false = read the cached result / poll for one."),
+    exclude_original: bool = Query(False,
+                                   description="Drop sounds TikTok flags as 'original sound'. Use this when you want actual music, not a creator's voice-over."),
+    duration_min: int | None = Query(None, ge=0, le=3600,
+                                     description="Minimum duration_seconds, e.g. 30 for Reels-friendly clips."),
+    duration_max: int | None = Query(None, ge=1, le=3600,
+                                     description="Maximum duration_seconds, e.g. 90."),
+    min_usage: int | None = Query(None, ge=0,
+                                  description="Minimum REAL global usage count. Sounds whose count could not be read are excluded while this is set."),
+    min_niche_frequency: int | None = Query(None, ge=0,
+                                            description="Keep only sounds used by at least N of the sampled niche videos. 2 means 'not a one-off'."),
+    commercial_ok: bool = Query(False,
+                                description="Keep only sounds TikTok flags as commercially usable. Sounds with an unknown flag are excluded."),
 ):
     keyword = (keyword or "").strip()
     hashtag = (hashtag or "").strip() or None
@@ -262,6 +323,15 @@ def trending(
                  "hint": "hashtags may contain only letters, digits and underscores, e.g. sadmusic"},
                 status_code=400,
             )
+
+    if (duration_min is not None and duration_max is not None
+            and duration_min > duration_max):
+        return JSONResponse(
+            {"status": "error",
+             "error": f"duration_min ({duration_min}) is greater than duration_max ({duration_max})",
+             "hint": "e.g. ?duration_min=30&duration_max=90"},
+            status_code=400,
+        )
 
     # Tri-state: omitted means "use the server default" (fresh unless
     # FRESH_BY_DEFAULT=0), so a plain search always returns a new mix while a
@@ -376,7 +446,25 @@ def trending(
 
     if decision in ("fresh", "stale-serve-and-refresh"):
         data = snapshot["data"] or []
-        capped = data[:limit]
+        filters = {
+            "exclude_original": exclude_original or None,
+            "duration_min": duration_min,
+            "duration_max": duration_max,
+            "min_usage": min_usage,
+            "min_niche_frequency": min_niche_frequency,
+            "commercial_ok": commercial_ok or None,
+        }
+        filters = {k: v for k, v in filters.items() if v is not None}
+        kept = _filter_sounds(
+            data,
+            exclude_original=exclude_original,
+            duration_min=duration_min,
+            duration_max=duration_max,
+            min_usage=min_usage,
+            min_niche_frequency=min_niche_frequency,
+            commercial_ok=commercial_ok,
+        ) if filters else list(data)
+        capped = kept[:limit]
         meta = dict(snapshot.get("meta") or {})
         meta.update({
             "stale": decision == "stale-serve-and-refresh",
@@ -386,8 +474,16 @@ def trending(
             "sounds_returned": len(capped),
             "requested_limit": limit,
             "with_usage_count": sum(1 for s in capped if s.get("video_count") is not None),
+            # Filter transparency: how many the scrape found, how many survived
+            # the query filters, and which filters were actually applied.
+            "filters_applied": filters or None,
+            "sounds_before_filters": len(data),
+            "sounds_after_filters": len(kept),
+            "filtered_out": len(data) - len(kept),
             # Auditable from the query response itself, not just /v1/health.
             "niche_priority": scraper.NICHE_PRIORITY,
+            "blended_rank": scraper.BLENDED_RANK,
+            "rank_mode": "blended" if scraper.BLENDED_RANK else "usage_priority",
             "niche_sounds": sum(1 for s in capped if s.get("is_niche")),
             "trending_only_sounds": sum(1 for s in capped if not s.get("is_niche")),
             "refresh_error": snapshot.get("refresh_error"),
@@ -429,6 +525,8 @@ def _health_body(probe: bool = False) -> dict:
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "usage_counts_available": scraper.usage_counts_available(),
         "niche_priority": scraper.NICHE_PRIORITY,
+        "blended_rank": scraper.BLENDED_RANK,
+        "rank_mode": "blended" if scraper.BLENDED_RANK else "usage_priority",
         "fresh_by_default": FRESH_BY_DEFAULT,
         "source": "tiktok_hashtag_mining",
         "timestamp": time.time(),
