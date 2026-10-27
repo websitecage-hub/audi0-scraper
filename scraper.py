@@ -88,7 +88,7 @@ TRENDING_COUNT = int(os.environ.get("TIKTOK_TRENDING_COUNT", "20"))
 # their sounds. Without it every scrape reads the same top videos and returns
 # an identical list; with it, a repeat search (or ?fresh=true) yields a
 # different mix of the same niche. 0 disables sampling (use the whole pool).
-POOL_SAMPLE = int(os.environ.get("TIKTOK_POOL_SAMPLE", "35"))
+POOL_SAMPLE = int(os.environ.get("TIKTOK_POOL_SAMPLE", "90"))
 
 # Expand an UNMAPPED keyword using TikTok's own query suggestions. This is what
 # gives every keyword a deep pool, not just the hand-mapped ones: an unmapped
@@ -98,16 +98,26 @@ POOL_SAMPLE = int(os.environ.get("TIKTOK_POOL_SAMPLE", "35"))
 # hand-written table.
 SUGGEST_TAGS = os.environ.get("TIKTOK_SUGGEST_TAGS", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
-HASHTAG_FANOUT = int(os.environ.get("TIKTOK_HASHTAG_FANOUT", "3"))
+HASHTAG_FANOUT = int(os.environ.get("TIKTOK_HASHTAG_FANOUT", "5"))
 MAX_WORKERS = int(os.environ.get("TIKTOK_MAX_WORKERS", "4"))
 ENRICH_WORKERS = int(os.environ.get("TIKTOK_ENRICH_WORKERS", "6"))
+
+# Pages per hashtag. /api/challenge/item_list/ answers count=30 and returns
+# `cursor` + `hasMore` (verified: cursor='30' after the first page), so a second
+# page doubles each tag's contribution to the pool: 5 tags x 60 + trending 20 =
+# up to 320 videos, vs ~110 before. Depth exists so STRICT filter combinations
+# (music, 30-90s, not a one-off) still have something to select from -- a strict
+# filter on a 110-video pool can legitimately empty the list, which breaks a
+# caller's pipeline. Pages are fetched serially per tag and stop early when the
+# scrape deadline is close, so depth never costs the request its latency bound.
+HASHTAG_PAGES = max(1, int(os.environ.get("TIKTOK_HASHTAG_PAGES", "2")))
 
 # How many of the most promising sounds get a /music/details call. Each call is
 # ~0.19s and was verified NOT to be retired after 25 sequential calls, so this
 # cap is about bounding one request's latency, not about evading a rate limit.
-ENRICH_TOP_N = int(os.environ.get("TIKTOK_ENRICH_TOP_N", "30"))
+ENRICH_TOP_N = int(os.environ.get("TIKTOK_ENRICH_TOP_N", "45"))
 
-SCRAPE_DEADLINE_SECONDS = float(os.environ.get("SCRAPE_DEADLINE_SECONDS", "25"))
+SCRAPE_DEADLINE_SECONDS = float(os.environ.get("SCRAPE_DEADLINE_SECONDS", "45"))
 MAX_RETRIES = int(os.environ.get("TIKTOK_MAX_RETRIES", "2"))
 BACKOFF_BASE_SECONDS = float(os.environ.get("TIKTOK_BACKOFF_BASE", "5"))
 
@@ -490,12 +500,33 @@ def hashtag_id(tag: str, deadline: float, country=None) -> tuple[str, dict]:
 
 
 def hashtag_videos(tag: str, deadline: float, country=None) -> list[dict]:
-    """Up to VIDEOS_PER_HASHTAG videos for one hashtag."""
+    """Up to VIDEOS_PER_HASHTAG x HASHTAG_PAGES videos for one hashtag.
+
+    The first page is the same call as before; further pages follow upstream's
+    `cursor` while it reports `hasMore`, pages remain, and the scrape deadline
+    has room. A stopped page walk just means a shallower pool -- never an error,
+    and never a retry loop against a rate limit.
+    """
     cid, _stats = hashtag_id(tag, deadline, country)
-    payload = _call(HASHTAG_VIDEOS_PATH,
-                    {"challengeID": cid, "count": VIDEOS_PER_HASHTAG, "cursor": 0},
-                    label=f"videos of #{tag}", deadline=deadline, country=country)
-    return P.videos(payload.get("itemList")) or []
+    videos: list[dict] = []
+    cursor: int | str = 0
+    for _page in range(max(1, HASHTAG_PAGES)):
+        payload = _call(HASHTAG_VIDEOS_PATH,
+                        {"challengeID": cid, "count": VIDEOS_PER_HASHTAG,
+                         "cursor": cursor},
+                        label=f"videos of #{tag}", deadline=deadline, country=country)
+        page = P.videos(payload.get("itemList")) or []
+        videos.extend(page)
+        if not payload.get("hasMore") or not page:
+            break
+        nxt = payload.get("cursor")
+        if isinstance(nxt, (int, str)) and str(nxt).isdigit():
+            cursor = int(nxt)
+        else:
+            cursor = len(videos)                 # fallback: offset by what we have
+        if time.monotonic() > deadline - 2:
+            break
+    return videos
 
 
 def trending_videos(deadline: float, country=None) -> list[dict]:

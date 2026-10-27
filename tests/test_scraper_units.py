@@ -257,9 +257,9 @@ def test_unmapped_keyword_is_expanded_with_suggestions(monkeypatch):
                         (str(abs(hash(tag)) % 99999), {}))
     tags, how = scraper.expand_hashtags("skateboarding")
     assert how == "derived+suggested"
-    assert len(tags) == 3
     assert tags[0] == "skateboarding", "the keyword's own tag stays first"
     assert "skateboardingtricks" in tags
+    assert len(tags) <= scraper.HASHTAG_FANOUT, "the fanout is a cap, never exceeded"
 
 
 def test_expansion_skips_tags_that_do_not_exist(monkeypatch):
@@ -412,6 +412,72 @@ def test_every_record_carries_rank_score():
 def test_per_hashtag_count_is_capped_at_the_verified_ceiling():
     """count=50 is rejected by TikTok (TikTokBadRequest); never allow it."""
     assert scraper.VIDEOS_PER_HASHTAG <= scraper.MAX_VIDEOS_PER_HASHTAG == 30
+
+
+# ---------------------------------------------------------------------------
+# pool depth: pagination + the depth/variety trade-off
+# ---------------------------------------------------------------------------
+
+def test_hashtag_videos_walks_the_cursor(monkeypatch):
+    """Two pages of 30 = 60 videos, following upstream's cursor + hasMore."""
+    calls = []
+
+    def fake_call(path, params, label=None, deadline=None, country=None):
+        calls.append(params["cursor"])
+        cursor = params["cursor"]
+        if cursor == 0:
+            return {"itemList": [{"id": f"p1-{i}"} for i in range(30)],
+                    "hasMore": True, "cursor": "30"}
+        return {"itemList": [{"id": f"p2-{i}"} for i in range(30)],
+                "hasMore": False, "cursor": "60"}
+
+    monkeypatch.setattr(scraper, "hashtag_id", lambda t, d, c=None: ("1", {}))
+    monkeypatch.setattr(scraper, "_call", fake_call)
+    monkeypatch.setattr(scraper, "HASHTAG_PAGES", 2)
+    monkeypatch.setattr(scraper.P, "videos",
+                        lambda items: items or [])
+    videos = scraper.hashtag_videos("gymtok", deadline=scraper.time.monotonic() + 30)
+    assert len(videos) == 60
+    assert calls == [0, 30], f"second page must resume from upstream's cursor, got {calls}"
+
+
+def test_hashtag_videos_stops_when_upstream_says_no_more(monkeypatch):
+    def fake_call(path, params, label=None, deadline=None, country=None):
+        return {"itemList": [{"id": f"v{i}"} for i in range(30)],
+                "hasMore": False, "cursor": "30"}
+
+    monkeypatch.setattr(scraper, "hashtag_id", lambda t, d, c=None: ("1", {}))
+    monkeypatch.setattr(scraper, "_call", fake_call)
+    monkeypatch.setattr(scraper, "HASHTAG_PAGES", 3)
+    monkeypatch.setattr(scraper.P, "videos", lambda items: items or [])
+    videos = scraper.hashtag_videos("gymtok", deadline=scraper.time.monotonic() + 30)
+    assert len(videos) == 30
+
+
+def test_hashtag_videos_stops_before_the_deadline(monkeypatch):
+    """Depth must never cost the latency bound: no page starts once the scrape
+    deadline is within 2 seconds."""
+    def fake_call(path, params, label=None, deadline=None, country=None):
+        return {"itemList": [{"id": f"v{i}"} for i in range(30)],
+                "hasMore": True, "cursor": "30"}
+
+    monkeypatch.setattr(scraper, "hashtag_id", lambda t, d, c=None: ("1", {}))
+    monkeypatch.setattr(scraper, "_call", fake_call)
+    monkeypatch.setattr(scraper, "HASHTAG_PAGES", 5)
+    monkeypatch.setattr(scraper.P, "videos", lambda items: items or [])
+    videos = scraper.hashtag_videos("gymtok", deadline=scraper.time.monotonic() + 1)
+    assert len(videos) == 30, "page 2 must not start inside the deadline guard"
+
+
+def test_sample_of_a_deep_pool_stays_a_minority_fraction():
+    """The variety contract: sampling ~90 of ~320 (not the whole pool) is what
+    keeps repeat-search overlap low. Guard the RATIO, not the absolute number,
+    so tuning one knob cannot silently break the other."""
+    deep_pool = [{"id": f"v{i}"} for i in range(320)]
+    for _ in range(10):
+        pool = scraper._sample_pool([("hashtag:gymtok", deep_pool)], scraper.POOL_SAMPLE)
+        assert len(pool) == scraper.POOL_SAMPLE
+        assert len(pool) / len(deep_pool) <= 0.5
 
 
 def test_unknown_usage_counts_sort_last_even_with_big_engagement():
